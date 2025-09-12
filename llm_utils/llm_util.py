@@ -15,6 +15,7 @@ Features:
 """
 
 import json
+import logging
 import os
 import threading
 import time
@@ -27,6 +28,72 @@ from collections import defaultdict
 import litellm
 from litellm import completion, completion_cost, get_llm_provider
 from litellm.exceptions import RateLimitError, APIConnectionError, APIError
+
+
+# Configure logging
+def setup_logging(level: str = "INFO", 
+                 log_file: Optional[str] = None,
+                 log_format: Optional[str] = None) -> logging.Logger:
+    """
+    Set up logging configuration for the LLM utilities.
+    
+    Args:
+        level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        log_file: Optional file path to write logs to
+        log_format: Optional custom log format string
+        
+    Returns:
+        Configured logger instance
+    """
+    logger = logging.getLogger("llm_utils")
+    
+    # Clear any existing handlers to avoid duplicates
+    logger.handlers.clear()
+    
+    # Set logging level
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    logger.setLevel(log_level)
+    
+    # Default log format
+    if log_format is None:
+        log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    
+    formatter = logging.Formatter(log_format)
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # File handler (if specified)
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(log_level)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    
+    # Prevent propagation to root logger
+    logger.propagate = False
+    
+    return logger
+
+
+def get_logger(name: str = "llm_utils") -> logging.Logger:
+    """
+    Get a logger instance for the specified name.
+    
+    Args:
+        name: Logger name (defaults to "llm_utils")
+        
+    Returns:
+        Logger instance
+    """
+    return logging.getLogger(name)
+
+
+# Initialize default logger
+logger = get_logger()
 
 
 @dataclass
@@ -72,17 +139,19 @@ class LLMUsageTracker:
     - Calculate costs and analytics
     """
     
-    def __init__(self, data_file: Optional[str] = None):
+    def __init__(self, data_file: Optional[str] = None, logger: Optional[logging.Logger] = None):
         """
         Initialize the usage tracker.
         
         Args:
             data_file: Path to the JSON file for persisting usage data.
                       If None, defaults to 'llm_usage_data.json' in current directory.
+            logger: Optional logger instance. If None, uses default logger.
         """
         self.data_file = data_file or "llm_usage_data.json"
         self.usage_data: List[UsageData] = []
         self.lock = threading.Lock()
+        self.logger = logger or get_logger("llm_utils.tracker")
         
         # Load existing data if file exists
         self.load_usage_data()
@@ -129,6 +198,23 @@ class LLMUsageTracker:
         
         with self.lock:
             self.usage_data.append(usage)
+        
+        # Log usage tracking
+        if success:
+            response_time_str = f"{response_time:.2f}s" if response_time is not None else "N/A"
+            self.logger.info(
+                f"Tracked successful usage: {model} ({provider}) - "
+                f"tokens: {total_tokens}, cost: ${cost:.4f}, "
+                f"response_time: {response_time_str}" + 
+                (f", request_id: {request_id}" if request_id else "")
+            )
+        else:
+            response_time_str = f"{response_time:.2f}s" if response_time is not None else "N/A"
+            self.logger.error(
+                f"Tracked failed usage: {model} ({provider}) - "
+                f"error: {error_message}, response_time: {response_time_str}" +
+                (f", request_id: {request_id}" if request_id else "")
+            )
     
     def get_aggregated_usage(self, 
                            start_date: Optional[datetime] = None,
@@ -256,8 +342,13 @@ class LLMUsageTracker:
         # Ensure directory exists
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
-        with open(save_path, 'w') as f:
-            json.dump(data_to_save, f, indent=2)
+        try:
+            with open(save_path, 'w') as f:
+                json.dump(data_to_save, f, indent=2)
+            self.logger.info(f"Saved {len(data_to_save)} usage records to {save_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to save usage data to {save_path}: {e}")
+            raise
     
     def load_usage_data(self, file_path: Optional[str] = None) -> None:
         """
@@ -269,6 +360,7 @@ class LLMUsageTracker:
         load_path = file_path or self.data_file
         
         if not os.path.exists(load_path):
+            self.logger.debug(f"Usage data file {load_path} does not exist, starting with empty data")
             return
         
         try:
@@ -277,8 +369,10 @@ class LLMUsageTracker:
             
             with self.lock:
                 self.usage_data = [UsageData(**item) for item in data]
+            self.logger.info(f"Loaded {len(self.usage_data)} usage records from {load_path}")
         except (json.JSONDecodeError, KeyError, TypeError) as e:
-            print(f"Warning: Could not load usage data from {load_path}: {e}")
+            self.logger.warning(f"Could not load usage data from {load_path}: {e}")
+            # Keep existing data if loading fails
     
     def clear_usage_data(self) -> None:
         """Clear all usage data from memory."""
@@ -319,7 +413,15 @@ class LLMClient:
     providers while automatically tracking usage and costs.
     """
     
-    def __init__(self, usage_tracker: Optional[LLMUsageTracker] = None, default_retry_attempts: int = 3, default_retry_delay: float = 1.0):
+    def __init__(self, 
+                 usage_tracker: Optional[LLMUsageTracker] = None, 
+                 default_retry_attempts: int = 3, 
+                 default_retry_delay: float = 1.0,
+                 default_model: Optional[str] = None,
+                 default_temperature: Optional[float] = None,
+                 default_max_tokens: Optional[int] = None,
+                 default_api_base: Optional[str] = None,
+                 logger: Optional[logging.Logger] = None):
         """
         Initialize the LLM client.
         
@@ -327,21 +429,31 @@ class LLMClient:
             usage_tracker: Optional usage tracker instance. If None, creates a new one.
             default_retry_attempts: Number of retry attempts for API errors
             default_retry_delay: Delay between retry attempts in seconds
+            default_model: Default model to use for requests
+            default_temperature: Default temperature for requests
+            default_max_tokens: Default max_tokens for requests
+            default_api_base: Default API base URL for requests
+            logger: Optional logger instance. If None, uses default logger.
         """
         self.usage_tracker = usage_tracker or LLMUsageTracker()
         self.default_retry_attempts = default_retry_attempts
         self.default_retry_delay = default_retry_delay
+        self.default_model = default_model
+        self.default_temperature = default_temperature
+        self.default_max_tokens = default_max_tokens
+        self.default_api_base = default_api_base
+        self.logger = logger or get_logger("llm_utils.client")
     
     def _make_request(self, 
-                     model: str,
                      messages: List[Dict[str, str]],
+                     model: Optional[str] = None,
                      **kwargs) -> Dict[str, Any]:
         """
         Make an LLM request with retry logic and usage tracking.
         
         Args:
-            model: The model to use (e.g., 'gpt-4', 'claude-3-sonnet')
             messages: List of message dictionaries
+            model: The model to use (e.g., 'gpt-4', 'claude-3-sonnet'). If None, uses default_model.
             **kwargs: Additional arguments for the completion call
             
         Returns:
@@ -350,22 +462,52 @@ class LLMClient:
         start_time = time.time()
         request_id = kwargs.get('request_id')
         
+        # Use default model if not provided
+        if model is None:
+            if self.default_model is None:
+                raise ValueError("No model provided and no default_model set")
+            model = self.default_model
+        
+        # Merge default parameters with provided kwargs
+        merged_kwargs = {}
+        
+        # Add default parameters if they exist and are not overridden
+        if self.default_temperature is not None and 'temperature' not in kwargs:
+            merged_kwargs['temperature'] = self.default_temperature
+        if self.default_max_tokens is not None and 'max_tokens' not in kwargs:
+            merged_kwargs['max_tokens'] = self.default_max_tokens
+        if self.default_api_base is not None and 'api_base' not in kwargs:
+            merged_kwargs['api_base'] = self.default_api_base
+        
+        # Add all provided kwargs (these will override defaults)
+        merged_kwargs.update(kwargs)
+        
         # Get provider information
         try:
             provider = get_llm_provider(model)
         except Exception:
             provider = "unknown"
         
+        # Log request details
+        self.logger.info(f"Making LLM request to {model} ({provider})" + 
+                        (f" with request_id: {request_id}" if request_id else ""))
+        
+        # Log prompts in debug mode
+        self.logger.debug(f"Request messages: {messages}")
+        self.logger.debug(f"Request parameters: {merged_kwargs}")
+        
         # Retry logic
         last_exception = None
         for attempt in range(self.default_retry_attempts):
             try:
+                if attempt > 0:
+                    self.logger.info(f"Retry attempt {attempt + 1}/{self.default_retry_attempts} for {model}")
+                
                 response = completion(
                     model=model,
                     messages=messages,
-                    **kwargs
+                    **merged_kwargs
                 )
-                print(response)
                 
                 # Track successful usage
                 response_time = time.time() - start_time
@@ -383,13 +525,29 @@ class LLMClient:
                     success=True
                 )
                 
+                # Log successful response
+                response_time_str = f"{response_time:.2f}s" if response_time is not None else "N/A"
+                self.logger.info(f"LLM request successful: {model} - "
+                               f"tokens: {usage_info.get('total_tokens', 0)}, "
+                               f"cost: ${usage_info.get('cost', 0.0):.4f}, "
+                               f"response_time: {response_time_str}")
+                
+                # Log response content in debug mode
+                if 'choices' in response and response['choices']:
+                    response_content = response['choices'][0].get('message', {}).get('content', '')
+                    if response_content:
+                        self.logger.debug(f"Response content: {response_content[:200]}{'...' if len(response_content) > 200 else ''}")
+                
                 return response
                 
             except (RateLimitError, APIConnectionError, APIError) as e:
                 last_exception = e
+                self.logger.warning(f"API error on attempt {attempt + 1}: {type(e).__name__}: {e}")
+                
                 if attempt < self.default_retry_attempts - 1:
-                    print(f"Retrying... {attempt + 1}/{self.default_retry_attempts}")
-                    time.sleep(self.default_retry_delay * (2 ** attempt))  # Exponential backoff
+                    retry_delay = self.default_retry_delay * (2 ** attempt)
+                    self.logger.info(f"Retrying in {retry_delay:.1f}s... ({attempt + 1}/{self.default_retry_attempts})")
+                    time.sleep(retry_delay)  # Exponential backoff
                     continue
                 else:
                     # Track failed usage
@@ -406,6 +564,7 @@ class LLMClient:
                         success=False,
                         error_message=str(e)
                     )
+                    self.logger.error(f"LLM request failed after {self.default_retry_attempts} attempts: {type(e).__name__}: {e}")
                     raise e
             except Exception as e:
                 # Track unexpected errors
@@ -422,45 +581,46 @@ class LLMClient:
                     success=False,
                     error_message=str(e)
                 )
+                self.logger.error(f"Unexpected error in LLM request: {type(e).__name__}: {e}")
                 raise e
         
         # This should never be reached, but just in case
         raise last_exception or Exception("Unknown error occurred")
     
     def chat_completion(self,
-                       model: str,
                        messages: List[Dict[str, str]],
+                       model: Optional[str] = None,
                        **kwargs) -> Dict[str, Any]:
         """
         Make a chat completion request.
         
         Args:
-            model: The model to use
             messages: List of message dictionaries with 'role' and 'content' keys
+            model: The model to use. If None, uses default_model.
             **kwargs: Additional arguments for the completion call
             
         Returns:
             Response dictionary from LiteLLM
         """
-        return self._make_request(model, messages, **kwargs)
+        return self._make_request(messages, model, **kwargs)
     
     def text_completion(self,
-                       model: str,
                        prompt: str,
+                       model: Optional[str] = None,
                        **kwargs) -> Dict[str, Any]:
         """
         Make a text completion request.
         
         Args:
-            model: The model to use
             prompt: The text prompt
+            model: The model to use. If None, uses default_model.
             **kwargs: Additional arguments for the completion call
             
         Returns:
             Response dictionary from LiteLLM
         """
         messages = [{"role": "user", "content": prompt}]
-        return self._make_request(model, messages, **kwargs)
+        return self._make_request(messages, model, **kwargs)
     
     def get_usage_stats(self, **kwargs) -> UsageAggregate:
         """
@@ -504,18 +664,35 @@ class LLMClient:
 
 
 # Convenience functions for quick usage
-def create_llm_client(data_file: Optional[str] = None) -> LLMClient:
+def create_llm_client(data_file: Optional[str] = None, 
+                     default_model: Optional[str] = None,
+                     default_temperature: Optional[float] = None,
+                     default_max_tokens: Optional[int] = None,
+                     default_api_base: Optional[str] = None,
+                     logger: Optional[logging.Logger] = None) -> LLMClient:
     """
     Create a new LLM client with usage tracking.
     
     Args:
         data_file: Optional path for usage data persistence
+        default_model: Default model to use for requests
+        default_temperature: Default temperature for requests
+        default_max_tokens: Default max_tokens for requests
+        default_api_base: Default API base URL for requests
+        logger: Optional logger instance
         
     Returns:
         LLMClient instance
     """
-    tracker = LLMUsageTracker(data_file)
-    return LLMClient(tracker)
+    tracker = LLMUsageTracker(data_file, logger)
+    return LLMClient(
+        tracker,
+        default_model=default_model,
+        default_temperature=default_temperature,
+        default_max_tokens=default_max_tokens,
+        default_api_base=default_api_base,
+        logger=logger
+    )
 
 
 def get_usage_summary(client: LLMClient, **kwargs) -> Dict[str, Any]:
@@ -545,18 +722,35 @@ def get_usage_summary(client: LLMClient, **kwargs) -> Dict[str, Any]:
 
 # Example usage and configuration
 if __name__ == "__main__":
-    # Example usage
-    client = create_llm_client("example_usage.json")
+    # Set up logging
+    setup_logging(level="INFO", log_file="llm_utils.log")
     
-    # Example chat completion
+    # Example usage with default parameters
+    client = LLMClient(
+        default_model="gpt-3.5-turbo",
+        default_temperature=0.7,
+        default_max_tokens=1000,
+        default_api_base=None  # Use default OpenAI API base
+    )
+    
+    # Example chat completion using default model and parameters
     try:
         response = client.chat_completion(
-            model="gpt-3.5-turbo",
             messages=[
                 {"role": "user", "content": "Hello, how are you?"}
             ]
         )
         print("Response:", response['choices'][0]['message']['content'])
+    except Exception as e:
+        print(f"Error: {e}")
+    
+    # Example text completion with overridden temperature
+    try:
+        response = client.text_completion(
+            prompt="Write a short poem about coding",
+            temperature=0.9  # Override default temperature
+        )
+        print("Poem:", response['choices'][0]['message']['content'])
     except Exception as e:
         print(f"Error: {e}")
     

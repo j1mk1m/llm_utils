@@ -10,6 +10,7 @@ This module tests all classes and functionalities in llm_util.py including:
 """
 
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -28,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from llm_utils.llm_util import (
     UsageData, UsageAggregate, LLMUsageTracker, LLMClient,
-    create_llm_client, get_usage_summary
+    create_llm_client, get_usage_summary, setup_logging, get_logger
 )
 
 
@@ -394,11 +395,29 @@ class TestLLMClient(unittest.TestCase):
         self.assertEqual(self.client.usage_tracker, self.tracker)
         self.assertEqual(self.client.default_retry_attempts, 3)
         self.assertEqual(self.client.default_retry_delay, 1.0)
+        self.assertIsNone(self.client.default_model)
+        self.assertIsNone(self.client.default_temperature)
+        self.assertIsNone(self.client.default_max_tokens)
+        self.assertIsNone(self.client.default_api_base)
     
     def test_client_initialization_defaults(self):
         """Test client initialization with default tracker."""
         client = LLMClient()
         self.assertIsInstance(client.usage_tracker, LLMUsageTracker)
+    
+    def test_client_initialization_with_default_params(self):
+        """Test client initialization with default completion parameters."""
+        client = LLMClient(
+            default_model="gpt-3.5-turbo",
+            default_temperature=0.7,
+            default_max_tokens=1000,
+            default_api_base="https://api.openai.com/v1"
+        )
+        
+        self.assertEqual(client.default_model, "gpt-3.5-turbo")
+        self.assertEqual(client.default_temperature, 0.7)
+        self.assertEqual(client.default_max_tokens, 1000)
+        self.assertEqual(client.default_api_base, "https://api.openai.com/v1")
     
     @patch('llm_utils.llm_util.completion')
     @patch('llm_utils.llm_util.completion_cost')
@@ -419,7 +438,7 @@ class TestLLMClient(unittest.TestCase):
         }
         
         messages = [{"role": "user", "content": "Hello"}]
-        response = self.client.chat_completion("gpt-3.5-turbo", messages)
+        response = self.client.chat_completion(messages, model="gpt-3.5-turbo")
         
         self.assertEqual(response['choices'][0]['message']['content'], 'Hello!')
         mock_completion.assert_called_once()
@@ -449,7 +468,7 @@ class TestLLMClient(unittest.TestCase):
             'cost': 0.0005
         }
         
-        response = self.client.text_completion("gpt-3.5-turbo", "Hello")
+        response = self.client.text_completion("Hello", model="gpt-3.5-turbo")
         
         self.assertEqual(response['choices'][0]['text'], 'Hello world!')
         mock_completion.assert_called_once()
@@ -490,7 +509,7 @@ class TestLLMClient(unittest.TestCase):
             }
             
             messages = [{"role": "user", "content": "Hello"}]
-            response = self.client.chat_completion("gpt-3.5-turbo", messages)
+            response = self.client.chat_completion(messages, model="gpt-3.5-turbo")
 
             self.assertEqual(response['choices'][0]['message']['content'], 'Success!')
             self.assertEqual(mock_completion.call_count, 2)
@@ -514,7 +533,7 @@ class TestLLMClient(unittest.TestCase):
         messages = [{"role": "user", "content": "Hello"}]
         
         with self.assertRaises(APIError):
-            self.client.chat_completion("gpt-3.5-turbo", messages)
+            self.client.chat_completion(messages, model="gpt-3.5-turbo")
         
         # Check that failed usage was tracked
         self.assertEqual(len(self.tracker.usage_data), 1)
@@ -560,6 +579,221 @@ class TestLLMClient(unittest.TestCase):
         os.remove(export_file)
 
 
+class TestDefaultParameters(unittest.TestCase):
+    """Test cases for default parameter functionality in LLMClient."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.temp_file = os.path.join(self.temp_dir, "default_params_test.json")
+        self.tracker = LLMUsageTracker(self.temp_file)
+        self.client = LLMClient(
+            self.tracker,
+            default_model="gpt-3.5-turbo",
+            default_temperature=0.7,
+            default_max_tokens=1000,
+            default_api_base="https://api.openai.com/v1"
+        )
+    
+    def tearDown(self):
+        """Clean up test fixtures."""
+        if os.path.exists(self.temp_file):
+            os.remove(self.temp_file)
+        os.rmdir(self.temp_dir)
+    
+    @patch('llm_utils.llm_util.completion')
+    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_chat_completion_with_defaults(self, mock_get_provider, mock_completion_cost, mock_completion):
+        """Test chat completion using all default parameters."""
+        mock_get_provider.return_value = "openai"
+        mock_completion.return_value = {
+            'choices': [{'message': {'content': 'Hello!'}}],
+            'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
+        }
+        mock_completion_cost.return_value = {
+            'prompt_tokens': 10,
+            'completion_tokens': 5,
+            'total_tokens': 15,
+            'cost': 0.001
+        }
+        
+        messages = [{"role": "user", "content": "Hello"}]
+        response = self.client.chat_completion(messages)
+        
+        self.assertEqual(response['choices'][0]['message']['content'], 'Hello!')
+        
+        # Check that completion was called with default parameters
+        mock_completion.assert_called_once()
+        call_args = mock_completion.call_args
+        self.assertEqual(call_args[1]['model'], "gpt-3.5-turbo")
+        self.assertEqual(call_args[1]['temperature'], 0.7)
+        self.assertEqual(call_args[1]['max_tokens'], 1000)
+        self.assertEqual(call_args[1]['api_base'], "https://api.openai.com/v1")
+    
+    @patch('llm_utils.llm_util.completion')
+    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_text_completion_with_defaults(self, mock_get_provider, mock_completion_cost, mock_completion):
+        """Test text completion using all default parameters."""
+        mock_get_provider.return_value = "openai"
+        mock_completion.return_value = {
+            'choices': [{'message': {'content': 'Hello world!'}}],
+            'usage': {'prompt_tokens': 5, 'completion_tokens': 3, 'total_tokens': 8}
+        }
+        mock_completion_cost.return_value = {
+            'prompt_tokens': 5,
+            'completion_tokens': 3,
+            'total_tokens': 8,
+            'cost': 0.0005
+        }
+        
+        response = self.client.text_completion("Hello")
+        
+        self.assertEqual(response['choices'][0]['message']['content'], 'Hello world!')
+        
+        # Check that completion was called with default parameters
+        mock_completion.assert_called_once()
+        call_args = mock_completion.call_args
+        self.assertEqual(call_args[1]['model'], "gpt-3.5-turbo")
+        self.assertEqual(call_args[1]['temperature'], 0.7)
+        self.assertEqual(call_args[1]['max_tokens'], 1000)
+        self.assertEqual(call_args[1]['api_base'], "https://api.openai.com/v1")
+    
+    @patch('llm_utils.llm_util.completion')
+    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_override_default_temperature(self, mock_get_provider, mock_completion_cost, mock_completion):
+        """Test overriding default temperature parameter."""
+        mock_get_provider.return_value = "openai"
+        mock_completion.return_value = {
+            'choices': [{'message': {'content': 'Hello!'}}],
+            'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
+        }
+        mock_completion_cost.return_value = {
+            'prompt_tokens': 10,
+            'completion_tokens': 5,
+            'total_tokens': 15,
+            'cost': 0.001
+        }
+        
+        messages = [{"role": "user", "content": "Hello"}]
+        response = self.client.chat_completion(messages, temperature=0.9)
+        
+        # Check that completion was called with overridden temperature
+        mock_completion.assert_called_once()
+        call_args = mock_completion.call_args
+        self.assertEqual(call_args[1]['temperature'], 0.9)
+        self.assertEqual(call_args[1]['model'], "gpt-3.5-turbo")  # Still uses default model
+        self.assertEqual(call_args[1]['max_tokens'], 1000)  # Still uses default max_tokens
+    
+    @patch('llm_utils.llm_util.completion')
+    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_override_default_model(self, mock_get_provider, mock_completion_cost, mock_completion):
+        """Test overriding default model parameter."""
+        mock_get_provider.return_value = "openai"
+        mock_completion.return_value = {
+            'choices': [{'message': {'content': 'Hello!'}}],
+            'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
+        }
+        mock_completion_cost.return_value = {
+            'prompt_tokens': 10,
+            'completion_tokens': 5,
+            'total_tokens': 15,
+            'cost': 0.001
+        }
+        
+        messages = [{"role": "user", "content": "Hello"}]
+        response = self.client.chat_completion(messages, model="gpt-4")
+        
+        # Check that completion was called with overridden model
+        mock_completion.assert_called_once()
+        call_args = mock_completion.call_args
+        self.assertEqual(call_args[1]['model'], "gpt-4")
+        self.assertEqual(call_args[1]['temperature'], 0.7)  # Still uses default temperature
+        self.assertEqual(call_args[1]['max_tokens'], 1000)  # Still uses default max_tokens
+    
+    @patch('llm_utils.llm_util.completion')
+    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_override_multiple_defaults(self, mock_get_provider, mock_completion_cost, mock_completion):
+        """Test overriding multiple default parameters."""
+        mock_get_provider.return_value = "openai"
+        mock_completion.return_value = {
+            'choices': [{'message': {'content': 'Hello!'}}],
+            'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
+        }
+        mock_completion_cost.return_value = {
+            'prompt_tokens': 10,
+            'completion_tokens': 5,
+            'total_tokens': 15,
+            'cost': 0.001
+        }
+        
+        messages = [{"role": "user", "content": "Hello"}]
+        response = self.client.chat_completion(
+            messages, 
+            model="gpt-4",
+            temperature=0.9,
+            max_tokens=500
+        )
+        
+        # Check that completion was called with overridden parameters
+        mock_completion.assert_called_once()
+        call_args = mock_completion.call_args
+        self.assertEqual(call_args[1]['model'], "gpt-4")
+        self.assertEqual(call_args[1]['temperature'], 0.9)
+        self.assertEqual(call_args[1]['max_tokens'], 500)
+        self.assertEqual(call_args[1]['api_base'], "https://api.openai.com/v1")  # Still uses default api_base
+    
+    def test_no_default_model_error(self):
+        """Test error when no model is provided and no default is set."""
+        client_no_default = LLMClient(self.tracker)  # No default model
+        
+        messages = [{"role": "user", "content": "Hello"}]
+        
+        with self.assertRaises(ValueError) as context:
+            client_no_default.chat_completion(messages)
+        
+        self.assertIn("No model provided and no default_model set", str(context.exception))
+    
+    @patch('llm_utils.llm_util.completion')
+    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_partial_defaults(self, mock_get_provider, mock_completion_cost, mock_completion):
+        """Test client with only some default parameters set."""
+        client_partial = LLMClient(
+            self.tracker,
+            default_model="gpt-3.5-turbo",
+            default_temperature=0.8
+            # No default max_tokens or api_base
+        )
+        
+        mock_get_provider.return_value = "openai"
+        mock_completion.return_value = {
+            'choices': [{'message': {'content': 'Hello!'}}],
+            'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
+        }
+        mock_completion_cost.return_value = {
+            'prompt_tokens': 10,
+            'completion_tokens': 5,
+            'total_tokens': 15,
+            'cost': 0.001
+        }
+        
+        messages = [{"role": "user", "content": "Hello"}]
+        response = client_partial.chat_completion(messages)
+        
+        # Check that completion was called with only the set defaults
+        mock_completion.assert_called_once()
+        call_args = mock_completion.call_args
+        self.assertEqual(call_args[1]['model'], "gpt-3.5-turbo")
+        self.assertEqual(call_args[1]['temperature'], 0.8)
+        self.assertNotIn('max_tokens', call_args[1])
+        self.assertNotIn('api_base', call_args[1])
+
+
 class TestConvenienceFunctions(unittest.TestCase):
     """Test cases for convenience functions."""
     
@@ -581,6 +815,11 @@ class TestConvenienceFunctions(unittest.TestCase):
         self.assertIsInstance(client, LLMClient)
         self.assertIsInstance(client.usage_tracker, LLMUsageTracker)
         self.assertEqual(client.usage_tracker.data_file, self.temp_file)
+        # Check that default parameters are None by default
+        self.assertIsNone(client.default_model)
+        self.assertIsNone(client.default_temperature)
+        self.assertIsNone(client.default_max_tokens)
+        self.assertIsNone(client.default_api_base)
     
     def test_create_llm_client_default(self):
         """Test create_llm_client function with default file."""
@@ -588,6 +827,23 @@ class TestConvenienceFunctions(unittest.TestCase):
         
         self.assertIsInstance(client, LLMClient)
         self.assertEqual(client.usage_tracker.data_file, "llm_usage_data.json")
+    
+    def test_create_llm_client_with_default_params(self):
+        """Test create_llm_client function with default parameters."""
+        client = create_llm_client(
+            data_file=self.temp_file,
+            default_model="gpt-3.5-turbo",
+            default_temperature=0.7,
+            default_max_tokens=1000,
+            default_api_base="https://api.openai.com/v1"
+        )
+        
+        self.assertIsInstance(client, LLMClient)
+        self.assertEqual(client.usage_tracker.data_file, self.temp_file)
+        self.assertEqual(client.default_model, "gpt-3.5-turbo")
+        self.assertEqual(client.default_temperature, 0.7)
+        self.assertEqual(client.default_max_tokens, 1000)
+        self.assertEqual(client.default_api_base, "https://api.openai.com/v1")
     
     def test_get_usage_summary(self):
         """Test get_usage_summary function."""
@@ -678,6 +934,298 @@ class TestEdgeCasesAndErrorHandling(unittest.TestCase):
         self.assertEqual(aggregate.model_breakdown, {})
         self.assertEqual(aggregate.provider_breakdown, {})
         self.assertEqual(aggregate.time_range, {"start": "", "end": ""})
+
+
+class TestLogging(unittest.TestCase):
+    """Test cases for logging functionality."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.temp_file = os.path.join(self.temp_dir, "test_logging.log")
+    
+    def tearDown(self):
+        """Clean up test fixtures."""
+        # Clean up temporary files
+        for file in os.listdir(self.temp_dir):
+            file_path = os.path.join(self.temp_dir, file)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+        os.rmdir(self.temp_dir)
+    
+    def test_setup_logging(self):
+        """Test basic logging setup."""
+        logger = setup_logging(level="INFO", log_file=self.temp_file)
+        
+        self.assertIsInstance(logger, logging.Logger)
+        self.assertEqual(logger.name, "llm_utils")
+        self.assertEqual(logger.level, logging.INFO)
+        
+        # Test that log file is created
+        logger.info("Test log message")
+        self.assertTrue(os.path.exists(self.temp_file))
+        
+        # Check log content
+        with open(self.temp_file, 'r') as f:
+            log_content = f.read()
+        self.assertIn("Test log message", log_content)
+    
+    def test_get_logger(self):
+        """Test getting logger instances."""
+        logger1 = get_logger("test_logger")
+        logger2 = get_logger("test_logger")
+        
+        # Should return the same logger instance
+        self.assertIs(logger1, logger2)
+        self.assertEqual(logger1.name, "test_logger")
+    
+    def test_usage_tracker_logging(self):
+        """Test logging in usage tracker."""
+        # Set up logging
+        setup_logging(level="INFO", log_file=self.temp_file)
+        
+        # Create tracker
+        tracker = LLMUsageTracker()
+        
+        # Track usage - should log
+        tracker.track_usage(
+            model="gpt-3.5-turbo",
+            provider="openai",
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+            cost=0.03,
+            response_time=1.5
+        )
+        
+        # Check that log was written
+        with open(self.temp_file, 'r') as f:
+            log_content = f.read()
+        self.assertIn("Tracked successful usage", log_content)
+        self.assertIn("gpt-3.5-turbo", log_content)
+        self.assertIn("openai", log_content)
+    
+    def test_usage_tracker_error_logging(self):
+        """Test error logging in usage tracker."""
+        # Set up logging
+        setup_logging(level="INFO", log_file=self.temp_file)
+        
+        # Create tracker
+        tracker = LLMUsageTracker()
+        
+        # Track failed usage - should log error
+        tracker.track_usage(
+            model="gpt-3.5-turbo",
+            provider="openai",
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            cost=0.0,
+            success=False,
+            error_message="Rate limit exceeded"
+        )
+        
+        # Check that error log was written
+        with open(self.temp_file, 'r') as f:
+            log_content = f.read()
+        self.assertIn("Tracked failed usage", log_content)
+        self.assertIn("Rate limit exceeded", log_content)
+    
+    def test_client_logging(self):
+        """Test logging in LLM client."""
+        # Set up logging
+        setup_logging(level="INFO", log_file=self.temp_file)
+        
+        # Create client
+        client = LLMClient(default_model="gpt-3.5-turbo")
+        
+        # Mock the completion call
+        with patch('llm_utils.llm_util.completion') as mock_completion, \
+             patch('llm_utils.llm_util.completion_cost') as mock_completion_cost, \
+             patch('llm_utils.llm_util.get_llm_provider') as mock_get_provider:
+            
+            mock_get_provider.return_value = "openai"
+            mock_completion.return_value = {
+                'choices': [{'message': {'content': 'Hello!'}}],
+                'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
+            }
+            mock_completion_cost.return_value = {
+                'prompt_tokens': 10,
+                'completion_tokens': 5,
+                'total_tokens': 15,
+                'cost': 0.001
+            }
+            
+            # Make request
+            response = client.chat_completion([
+                {"role": "user", "content": "Hello"}
+            ])
+            
+            # Check that logs were written
+            with open(self.temp_file, 'r') as f:
+                log_content = f.read()
+            
+            self.assertIn("Making LLM request to gpt-3.5-turbo", log_content)
+            self.assertIn("LLM request successful", log_content)
+            self.assertIn("openai", log_content)
+    
+    def test_client_debug_logging(self):
+        """Test debug logging in LLM client."""
+        # Set up debug logging
+        setup_logging(level="DEBUG", log_file=self.temp_file)
+        
+        # Create client
+        client = LLMClient(default_model="gpt-3.5-turbo")
+        
+        # Mock the completion call
+        with patch('llm_utils.llm_util.completion') as mock_completion, \
+             patch('llm_utils.llm_util.completion_cost') as mock_completion_cost, \
+             patch('llm_utils.llm_util.get_llm_provider') as mock_get_provider:
+            
+            mock_get_provider.return_value = "openai"
+            mock_completion.return_value = {
+                'choices': [{'message': {'content': 'Hello world!'}}],
+                'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
+            }
+            mock_completion_cost.return_value = {
+                'prompt_tokens': 10,
+                'completion_tokens': 5,
+                'total_tokens': 15,
+                'cost': 0.001
+            }
+            
+            # Make request
+            response = client.chat_completion([
+                {"role": "user", "content": "Hello"}
+            ])
+            
+            # Check that debug logs were written
+            with open(self.temp_file, 'r') as f:
+                log_content = f.read()
+            
+            self.assertIn("Request messages:", log_content)
+            self.assertIn("Request parameters:", log_content)
+            self.assertIn("Response content:", log_content)
+    
+    def test_client_error_logging(self):
+        """Test error logging in LLM client."""
+        # Set up logging
+        setup_logging(level="INFO", log_file=self.temp_file)
+        
+        # Create client
+        client = LLMClient(default_model="gpt-3.5-turbo")
+        
+        # Mock the completion call to raise an error
+        with patch('llm_utils.llm_util.completion') as mock_completion, \
+             patch('llm_utils.llm_util.get_llm_provider') as mock_get_provider:
+            
+            mock_get_provider.return_value = "openai"
+            mock_completion.side_effect = Exception("API Error")
+            
+            # Make request - should log error
+            with self.assertRaises(Exception):
+                client.chat_completion([
+                    {"role": "user", "content": "Hello"}
+                ])
+            
+            # Check that error log was written
+            with open(self.temp_file, 'r') as f:
+                log_content = f.read()
+            
+            self.assertIn("Unexpected error in LLM request", log_content)
+            self.assertIn("API Error", log_content)
+    
+    def test_retry_logging(self):
+        """Test retry logging in LLM client."""
+        # Set up logging
+        setup_logging(level="INFO", log_file=self.temp_file)
+        
+        # Create client with short retry delay for testing
+        client = LLMClient(default_model="gpt-3.5-turbo", default_retry_delay=0.1)
+        
+        # Mock the completion call to fail first, then succeed
+        with patch('llm_utils.llm_util.completion') as mock_completion, \
+             patch('llm_utils.llm_util.completion_cost') as mock_completion_cost, \
+             patch('llm_utils.llm_util.get_llm_provider') as mock_get_provider:
+            
+            mock_get_provider.return_value = "openai"
+            
+            # Import the exception class
+            try:
+                from litellm.exceptions import RateLimitError
+            except ImportError:
+                # Create a mock exception if litellm is not available
+                class RateLimitError(Exception):
+                    pass
+            
+            # First call fails with rate limit, second succeeds
+            mock_completion.side_effect = [
+                RateLimitError(500, "Rate limit exceeded", "openai", "gpt-3.5-turbo"),
+                {'choices': [{'message': {'content': 'Success!'}}], 'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}}
+            ]
+            
+            mock_completion_cost.return_value = {
+                'prompt_tokens': 10,
+                'completion_tokens': 5,
+                'total_tokens': 15,
+                'cost': 0.001
+            }
+            
+            # Make request
+            response = client.chat_completion([
+                {"role": "user", "content": "Hello"}
+            ])
+            
+            # Check that retry logs were written
+            with open(self.temp_file, 'r') as f:
+                log_content = f.read()
+            
+            self.assertIn("Retry attempt", log_content)
+            self.assertIn("Retrying in", log_content)
+    
+    def test_custom_logger(self):
+        """Test using custom logger with client."""
+        # Create custom logger
+        custom_logger = logging.getLogger("custom_test_logger")
+        custom_logger.setLevel(logging.INFO)
+        
+        # Add handler to custom logger
+        handler = logging.FileHandler(self.temp_file)
+        formatter = logging.Formatter("%(name)s - %(levelname)s - %(message)s")
+        handler.setFormatter(formatter)
+        custom_logger.addHandler(handler)
+        
+        # Create client with custom logger
+        client = LLMClient(default_model="gpt-3.5-turbo", logger=custom_logger)
+        
+        # Mock the completion call
+        with patch('llm_utils.llm_util.completion') as mock_completion, \
+             patch('llm_utils.llm_util.completion_cost') as mock_completion_cost, \
+             patch('llm_utils.llm_util.get_llm_provider') as mock_get_provider:
+            
+            mock_get_provider.return_value = "openai"
+            mock_completion.return_value = {
+                'choices': [{'message': {'content': 'Hello!'}}],
+                'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
+            }
+            mock_completion_cost.return_value = {
+                'prompt_tokens': 10,
+                'completion_tokens': 5,
+                'total_tokens': 15,
+                'cost': 0.001
+            }
+            
+            # Make request
+            response = client.chat_completion([
+                {"role": "user", "content": "Hello"}
+            ])
+            
+            # Check that custom logger was used
+            with open(self.temp_file, 'r') as f:
+                log_content = f.read()
+            
+            self.assertIn("custom_test_logger", log_content)
+            self.assertIn("Making LLM request", log_content)
 
 
 if __name__ == '__main__':
