@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm_utils"
+version = "1.0.0"
+authors = [
+    {name = "James Kim", email = "j1mk1m1016@gmail.com"}
+]
+description = "LLM Utilities"
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "litellm",
+]
+
+[project.urls]
+Homepage = "https://github.com/j1mk1m/llm_utils"
+Repository = "https://github.com/j1mk1m/llm_utils"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["llm_utils*"]
