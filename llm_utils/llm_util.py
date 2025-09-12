@@ -547,7 +547,7 @@ class LLMClient:
                 
                 # Get detailed cost breakdown
                 prompt_tokens = token_counter(model=model, messages=messages)
-                completion_tokens = token_counter(model=model, messages=response['choices'][0]['message']['content'])
+                completion_tokens = token_counter(model=model, messages=[response['choices'][0]['message']])
                 total_tokens = prompt_tokens + completion_tokens
                 
                 # Calculate detailed costs
