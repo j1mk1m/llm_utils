@@ -49,7 +49,9 @@ class TestUsageData(unittest.TestCase):
             request_id="req-123",
             response_time=1.5,
             success=True,
-            error_message=None
+            error_message=None,
+            prompt_cost=0.02,
+            completion_cost=0.01
         )
         
         self.assertEqual(usage.timestamp, "2024-01-01T00:00:00Z")
@@ -63,6 +65,8 @@ class TestUsageData(unittest.TestCase):
         self.assertEqual(usage.response_time, 1.5)
         self.assertTrue(usage.success)
         self.assertIsNone(usage.error_message)
+        self.assertEqual(usage.prompt_cost, 0.02)
+        self.assertEqual(usage.completion_cost, 0.01)
     
     def test_usage_data_defaults(self):
         """Test UsageData creation with default values."""
@@ -80,6 +84,8 @@ class TestUsageData(unittest.TestCase):
         self.assertIsNone(usage.response_time)
         self.assertTrue(usage.success)
         self.assertIsNone(usage.error_message)
+        self.assertIsNone(usage.prompt_cost)
+        self.assertIsNone(usage.completion_cost)
 
 
 class TestUsageAggregate(unittest.TestCase):
@@ -420,9 +426,10 @@ class TestLLMClient(unittest.TestCase):
         self.assertEqual(client.default_api_base, "https://api.openai.com/v1")
     
     @patch('llm_utils.llm_util.completion')
-    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
     @patch('llm_utils.llm_util.get_llm_provider')
-    def test_chat_completion_success(self, mock_get_provider, mock_completion_cost, mock_completion):
+    def test_chat_completion_success(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
         """Test successful chat completion."""
         # Mock responses
         mock_get_provider.return_value = "openai"
@@ -430,12 +437,8 @@ class TestLLMClient(unittest.TestCase):
             'choices': [{'message': {'content': 'Hello!'}}],
             'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
         }
-        mock_completion_cost.return_value = {
-            'prompt_tokens': 10,
-            'completion_tokens': 5,
-            'total_tokens': 15,
-            'cost': 0.001
-        }
+        mock_completion_cost.return_value = 0.001  # Now returns float
+        mock_token_counter.side_effect = [10, 5]  # prompt_tokens, completion_tokens
         
         messages = [{"role": "user", "content": "Hello"}]
         response = self.client.chat_completion(messages, model="gpt-3.5-turbo")
@@ -451,26 +454,23 @@ class TestLLMClient(unittest.TestCase):
         self.assertTrue(usage.success)
     
     @patch('llm_utils.llm_util.completion')
-    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
     @patch('llm_utils.llm_util.get_llm_provider')
-    def test_text_completion_success(self, mock_get_provider, mock_completion_cost, mock_completion):
+    def test_text_completion_success(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
         """Test successful text completion."""
         # Mock responses
         mock_get_provider.return_value = "openai"
         mock_completion.return_value = {
-            'choices': [{'text': 'Hello world!'}],
+            'choices': [{'message': {'content': 'Hello world!'}}],
             'usage': {'prompt_tokens': 5, 'completion_tokens': 3, 'total_tokens': 8}
         }
-        mock_completion_cost.return_value = {
-            'prompt_tokens': 5,
-            'completion_tokens': 3,
-            'total_tokens': 8,
-            'cost': 0.0005
-        }
+        mock_completion_cost.return_value = 0.0005  # Now returns float
+        mock_token_counter.side_effect = [5, 3]  # prompt_tokens, completion_tokens
         
         response = self.client.text_completion("Hello", model="gpt-3.5-turbo")
         
-        self.assertEqual(response['choices'][0]['text'], 'Hello world!')
+        self.assertEqual(response['choices'][0]['message']['content'], 'Hello world!')
         mock_completion.assert_called_once()
         
         # Check that usage was tracked
@@ -480,9 +480,10 @@ class TestLLMClient(unittest.TestCase):
         self.assertTrue(usage.success)
     
     @patch('llm_utils.llm_util.completion')
-    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
     @patch('llm_utils.llm_util.get_llm_provider')
-    def test_retry_logic_on_rate_limit(self, mock_get_provider, mock_completion_cost, mock_completion):
+    def test_retry_logic_on_rate_limit(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
         """Test retry logic on rate limit error."""
         # Import here to avoid import issues in test environment
         try:
@@ -500,22 +501,17 @@ class TestLLMClient(unittest.TestCase):
             {'choices': [{'message': {'content': 'Success!'}}]}
         ]
         
-        with patch('llm_utils.llm_util.completion_cost') as mock_completion_cost:
-            mock_completion_cost.return_value = {
-                'prompt_tokens': 10,
-                'completion_tokens': 5,
-                'total_tokens': 15,
-                'cost': 0.001
-            }
-            
-            messages = [{"role": "user", "content": "Hello"}]
-            response = self.client.chat_completion(messages, model="gpt-3.5-turbo")
+        mock_completion_cost.return_value = 0.001  # Now returns float
+        mock_token_counter.side_effect = [10, 5]  # prompt_tokens, completion_tokens
+        
+        messages = [{"role": "user", "content": "Hello"}]
+        response = self.client.chat_completion(messages, model="gpt-3.5-turbo")
 
-            self.assertEqual(response['choices'][0]['message']['content'], 'Success!')
-            self.assertEqual(mock_completion.call_count, 2)
+        self.assertEqual(response['choices'][0]['message']['content'], 'Success!')
+        self.assertEqual(mock_completion.call_count, 2)
     
     @patch('llm_utils.llm_util.completion')
-    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
     @patch('llm_utils.llm_util.get_llm_provider')
     def test_track_failed_usage(self, mock_get_provider, mock_completion_cost, mock_completion):
         """Test tracking failed usage."""
@@ -602,21 +598,18 @@ class TestDefaultParameters(unittest.TestCase):
         os.rmdir(self.temp_dir)
     
     @patch('llm_utils.llm_util.completion')
-    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
     @patch('llm_utils.llm_util.get_llm_provider')
-    def test_chat_completion_with_defaults(self, mock_get_provider, mock_completion_cost, mock_completion):
+    def test_chat_completion_with_defaults(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
         """Test chat completion using all default parameters."""
         mock_get_provider.return_value = "openai"
         mock_completion.return_value = {
             'choices': [{'message': {'content': 'Hello!'}}],
             'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
         }
-        mock_completion_cost.return_value = {
-            'prompt_tokens': 10,
-            'completion_tokens': 5,
-            'total_tokens': 15,
-            'cost': 0.001
-        }
+        mock_completion_cost.return_value = 0.001  # Now returns float
+        mock_token_counter.side_effect = [10, 5]  # prompt_tokens, completion_tokens
         
         messages = [{"role": "user", "content": "Hello"}]
         response = self.client.chat_completion(messages)
@@ -632,21 +625,18 @@ class TestDefaultParameters(unittest.TestCase):
         self.assertEqual(call_args[1]['api_base'], "https://api.openai.com/v1")
     
     @patch('llm_utils.llm_util.completion')
-    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
     @patch('llm_utils.llm_util.get_llm_provider')
-    def test_text_completion_with_defaults(self, mock_get_provider, mock_completion_cost, mock_completion):
+    def test_text_completion_with_defaults(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
         """Test text completion using all default parameters."""
         mock_get_provider.return_value = "openai"
         mock_completion.return_value = {
             'choices': [{'message': {'content': 'Hello world!'}}],
             'usage': {'prompt_tokens': 5, 'completion_tokens': 3, 'total_tokens': 8}
         }
-        mock_completion_cost.return_value = {
-            'prompt_tokens': 5,
-            'completion_tokens': 3,
-            'total_tokens': 8,
-            'cost': 0.0005
-        }
+        mock_completion_cost.return_value = 0.0005  # Now returns float
+        mock_token_counter.side_effect = [5, 3]  # prompt_tokens, completion_tokens
         
         response = self.client.text_completion("Hello")
         
@@ -661,21 +651,18 @@ class TestDefaultParameters(unittest.TestCase):
         self.assertEqual(call_args[1]['api_base'], "https://api.openai.com/v1")
     
     @patch('llm_utils.llm_util.completion')
-    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
     @patch('llm_utils.llm_util.get_llm_provider')
-    def test_override_default_temperature(self, mock_get_provider, mock_completion_cost, mock_completion):
+    def test_override_default_temperature(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
         """Test overriding default temperature parameter."""
         mock_get_provider.return_value = "openai"
         mock_completion.return_value = {
             'choices': [{'message': {'content': 'Hello!'}}],
             'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
         }
-        mock_completion_cost.return_value = {
-            'prompt_tokens': 10,
-            'completion_tokens': 5,
-            'total_tokens': 15,
-            'cost': 0.001
-        }
+        mock_completion_cost.return_value = 0.001  # Now returns float
+        mock_token_counter.side_effect = [10, 5]  # prompt_tokens, completion_tokens
         
         messages = [{"role": "user", "content": "Hello"}]
         response = self.client.chat_completion(messages, temperature=0.9)
@@ -688,21 +675,18 @@ class TestDefaultParameters(unittest.TestCase):
         self.assertEqual(call_args[1]['max_tokens'], 1000)  # Still uses default max_tokens
     
     @patch('llm_utils.llm_util.completion')
-    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
     @patch('llm_utils.llm_util.get_llm_provider')
-    def test_override_default_model(self, mock_get_provider, mock_completion_cost, mock_completion):
+    def test_override_default_model(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
         """Test overriding default model parameter."""
         mock_get_provider.return_value = "openai"
         mock_completion.return_value = {
             'choices': [{'message': {'content': 'Hello!'}}],
             'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
         }
-        mock_completion_cost.return_value = {
-            'prompt_tokens': 10,
-            'completion_tokens': 5,
-            'total_tokens': 15,
-            'cost': 0.001
-        }
+        mock_completion_cost.return_value = 0.001  # Now returns float
+        mock_token_counter.side_effect = [10, 5]  # prompt_tokens, completion_tokens
         
         messages = [{"role": "user", "content": "Hello"}]
         response = self.client.chat_completion(messages, model="gpt-4")
@@ -715,21 +699,18 @@ class TestDefaultParameters(unittest.TestCase):
         self.assertEqual(call_args[1]['max_tokens'], 1000)  # Still uses default max_tokens
     
     @patch('llm_utils.llm_util.completion')
-    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
     @patch('llm_utils.llm_util.get_llm_provider')
-    def test_override_multiple_defaults(self, mock_get_provider, mock_completion_cost, mock_completion):
+    def test_override_multiple_defaults(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
         """Test overriding multiple default parameters."""
         mock_get_provider.return_value = "openai"
         mock_completion.return_value = {
             'choices': [{'message': {'content': 'Hello!'}}],
             'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
         }
-        mock_completion_cost.return_value = {
-            'prompt_tokens': 10,
-            'completion_tokens': 5,
-            'total_tokens': 15,
-            'cost': 0.001
-        }
+        mock_completion_cost.return_value = 0.001  # Now returns float
+        mock_token_counter.side_effect = [10, 5]  # prompt_tokens, completion_tokens
         
         messages = [{"role": "user", "content": "Hello"}]
         response = self.client.chat_completion(
@@ -759,9 +740,10 @@ class TestDefaultParameters(unittest.TestCase):
         self.assertIn("No model provided and no default_model set", str(context.exception))
     
     @patch('llm_utils.llm_util.completion')
-    @patch('llm_utils.llm_util.completion_cost')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
     @patch('llm_utils.llm_util.get_llm_provider')
-    def test_partial_defaults(self, mock_get_provider, mock_completion_cost, mock_completion):
+    def test_partial_defaults(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
         """Test client with only some default parameters set."""
         client_partial = LLMClient(
             self.tracker,
@@ -775,12 +757,8 @@ class TestDefaultParameters(unittest.TestCase):
             'choices': [{'message': {'content': 'Hello!'}}],
             'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
         }
-        mock_completion_cost.return_value = {
-            'prompt_tokens': 10,
-            'completion_tokens': 5,
-            'total_tokens': 15,
-            'cost': 0.001
-        }
+        mock_completion_cost.return_value = 0.001  # Now returns float
+        mock_token_counter.side_effect = [10, 5]  # prompt_tokens, completion_tokens
         
         messages = [{"role": "user", "content": "Hello"}]
         response = client_partial.chat_completion(messages)
@@ -1041,7 +1019,8 @@ class TestLogging(unittest.TestCase):
         
         # Mock the completion call
         with patch('llm_utils.llm_util.completion') as mock_completion, \
-             patch('llm_utils.llm_util.completion_cost') as mock_completion_cost, \
+             patch('llm_utils.llm_util.litellm_get_total_cost') as mock_completion_cost, \
+             patch('llm_utils.llm_util.token_counter') as mock_token_counter, \
              patch('llm_utils.llm_util.get_llm_provider') as mock_get_provider:
             
             mock_get_provider.return_value = "openai"
@@ -1049,12 +1028,8 @@ class TestLogging(unittest.TestCase):
                 'choices': [{'message': {'content': 'Hello!'}}],
                 'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
             }
-            mock_completion_cost.return_value = {
-                'prompt_tokens': 10,
-                'completion_tokens': 5,
-                'total_tokens': 15,
-                'cost': 0.001
-            }
+            mock_completion_cost.return_value = 0.001  # Now returns float
+            mock_token_counter.side_effect = [10, 5]  # prompt_tokens, completion_tokens
             
             # Make request
             response = client.chat_completion([
@@ -1079,7 +1054,8 @@ class TestLogging(unittest.TestCase):
         
         # Mock the completion call
         with patch('llm_utils.llm_util.completion') as mock_completion, \
-             patch('llm_utils.llm_util.completion_cost') as mock_completion_cost, \
+             patch('llm_utils.llm_util.litellm_get_total_cost') as mock_completion_cost, \
+             patch('llm_utils.llm_util.token_counter') as mock_token_counter, \
              patch('llm_utils.llm_util.get_llm_provider') as mock_get_provider:
             
             mock_get_provider.return_value = "openai"
@@ -1087,12 +1063,8 @@ class TestLogging(unittest.TestCase):
                 'choices': [{'message': {'content': 'Hello world!'}}],
                 'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
             }
-            mock_completion_cost.return_value = {
-                'prompt_tokens': 10,
-                'completion_tokens': 5,
-                'total_tokens': 15,
-                'cost': 0.001
-            }
+            mock_completion_cost.return_value = 0.001  # Now returns float
+            mock_token_counter.side_effect = [10, 5]  # prompt_tokens, completion_tokens
             
             # Make request
             response = client.chat_completion([
@@ -1145,7 +1117,8 @@ class TestLogging(unittest.TestCase):
         
         # Mock the completion call to fail first, then succeed
         with patch('llm_utils.llm_util.completion') as mock_completion, \
-             patch('llm_utils.llm_util.completion_cost') as mock_completion_cost, \
+             patch('llm_utils.llm_util.litellm_get_total_cost') as mock_completion_cost, \
+             patch('llm_utils.llm_util.token_counter') as mock_token_counter, \
              patch('llm_utils.llm_util.get_llm_provider') as mock_get_provider:
             
             mock_get_provider.return_value = "openai"
@@ -1164,12 +1137,8 @@ class TestLogging(unittest.TestCase):
                 {'choices': [{'message': {'content': 'Success!'}}], 'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}}
             ]
             
-            mock_completion_cost.return_value = {
-                'prompt_tokens': 10,
-                'completion_tokens': 5,
-                'total_tokens': 15,
-                'cost': 0.001
-            }
+            mock_completion_cost.return_value = 0.001  # Now returns float
+            mock_token_counter.side_effect = [10, 5]  # prompt_tokens, completion_tokens
             
             # Make request
             response = client.chat_completion([
@@ -1200,7 +1169,8 @@ class TestLogging(unittest.TestCase):
         
         # Mock the completion call
         with patch('llm_utils.llm_util.completion') as mock_completion, \
-             patch('llm_utils.llm_util.completion_cost') as mock_completion_cost, \
+             patch('llm_utils.llm_util.litellm_get_total_cost') as mock_completion_cost, \
+             patch('llm_utils.llm_util.token_counter') as mock_token_counter, \
              patch('llm_utils.llm_util.get_llm_provider') as mock_get_provider:
             
             mock_get_provider.return_value = "openai"
@@ -1208,12 +1178,8 @@ class TestLogging(unittest.TestCase):
                 'choices': [{'message': {'content': 'Hello!'}}],
                 'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
             }
-            mock_completion_cost.return_value = {
-                'prompt_tokens': 10,
-                'completion_tokens': 5,
-                'total_tokens': 15,
-                'cost': 0.001
-            }
+            mock_completion_cost.return_value = 0.001  # Now returns float
+            mock_token_counter.side_effect = [10, 5]  # prompt_tokens, completion_tokens
             
             # Make request
             response = client.chat_completion([

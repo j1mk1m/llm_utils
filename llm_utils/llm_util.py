@@ -25,8 +25,8 @@ from typing import Any, Dict, List, Optional, Union, Literal
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 
-import litellm
-from litellm import completion, completion_cost, get_llm_provider
+from litellm import completion, get_llm_provider, token_counter, cost_per_token
+from litellm import completion_cost as litellm_get_total_cost
 from litellm.exceptions import RateLimitError, APIConnectionError, APIError
 
 
@@ -110,6 +110,8 @@ class UsageData:
     response_time: Optional[float] = None
     success: bool = True
     error_message: Optional[str] = None
+    prompt_cost: Optional[float] = None
+    completion_cost: Optional[float] = None
 
 
 @dataclass
@@ -156,6 +158,30 @@ class LLMUsageTracker:
         # Load existing data if file exists
         self.load_usage_data()
     
+    def calculate_token_costs(self, model: str, prompt_tokens: int, completion_tokens: int) -> tuple[float, float, float]:
+        """
+        Calculate detailed costs for prompt and completion tokens.
+        
+        Args:
+            model: Model name
+            prompt_tokens: Number of prompt tokens
+            completion_tokens: Number of completion tokens
+            
+        Returns:
+            Tuple of (prompt_cost, completion_cost, total_cost)
+        """
+        try:
+            prompt_cost, completion_cost = cost_per_token(
+                model=model, 
+                prompt_tokens=prompt_tokens, 
+                completion_tokens=completion_tokens
+            )
+            total_cost = prompt_cost + completion_cost
+            return prompt_cost, completion_cost, total_cost
+        except Exception as e:
+            self.logger.warning(f"Failed to calculate costs for {model}: {e}")
+            return 0.0, 0.0, 0.0
+    
     def track_usage(self, 
                    model: str,
                    provider: str,
@@ -166,7 +192,9 @@ class LLMUsageTracker:
                    request_id: Optional[str] = None,
                    response_time: Optional[float] = None,
                    success: bool = True,
-                   error_message: Optional[str] = None) -> None:
+                   error_message: Optional[str] = None,
+                   prompt_cost: Optional[float] = None,
+                   completion_cost: Optional[float] = None) -> None:
         """
         Track a single LLM usage event.
         
@@ -181,6 +209,8 @@ class LLMUsageTracker:
             response_time: Response time in seconds
             success: Whether the request was successful
             error_message: Error message if request failed
+            prompt_cost: Cost for prompt tokens only
+            completion_cost: Cost for completion tokens only
         """
         usage = UsageData(
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -193,7 +223,9 @@ class LLMUsageTracker:
             request_id=request_id,
             response_time=response_time,
             success=success,
-            error_message=error_message
+            error_message=error_message,
+            prompt_cost=prompt_cost,
+            completion_cost=completion_cost,
         )
         
         with self.lock:
@@ -511,25 +543,37 @@ class LLMClient:
                 
                 # Track successful usage
                 response_time = time.time() - start_time
-                usage_info = completion_cost(response)
+                total_cost = litellm_get_total_cost(response)
+                
+                # Get detailed cost breakdown
+                prompt_tokens = token_counter(model=model, messages=messages)
+                completion_tokens = token_counter(model=model, messages=response['choices'][0]['message']['content'])
+                total_tokens = prompt_tokens + completion_tokens
+                
+                # Calculate detailed costs
+                prompt_cost, completion_cost, _= self.usage_tracker.calculate_token_costs(
+                    model, prompt_tokens, completion_tokens
+                )
                 
                 self.usage_tracker.track_usage(
                     model=model,
                     provider=provider,
-                    prompt_tokens=usage_info.get('prompt_tokens', 0),
-                    completion_tokens=usage_info.get('completion_tokens', 0),
-                    total_tokens=usage_info.get('total_tokens', 0),
-                    cost=usage_info.get('cost', 0.0),
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    cost=total_cost,
                     request_id=request_id,
                     response_time=response_time,
-                    success=True
+                    success=True,
+                    prompt_cost=prompt_cost,
+                    completion_cost=completion_cost,
                 )
                 
                 # Log successful response
                 response_time_str = f"{response_time:.2f}s" if response_time is not None else "N/A"
                 self.logger.info(f"LLM request successful: {model} - "
-                               f"tokens: {usage_info.get('total_tokens', 0)}, "
-                               f"cost: ${usage_info.get('cost', 0.0):.4f}, "
+                               f"tokens: {total_tokens}, "
+                               f"cost: ${total_cost:.4f}, "
                                f"response_time: {response_time_str}")
                 
                 # Log response content in debug mode
@@ -661,6 +705,105 @@ class LLMClient:
             format: Export format ('json' or 'csv')
         """
         self.usage_tracker.export_usage_data(file_path, format)
+    
+    def count_tokens(self, text: str, model: Optional[str] = None) -> int:
+        """
+        Count tokens in text using the appropriate tokenizer.
+        
+        Args:
+            text: Text to count tokens for
+            model: Model name. If None, uses default_model.
+            
+        Returns:
+            Number of tokens
+        """
+        model = model or self.default_model
+        if model is None:
+            raise ValueError("No model provided and no default_model set")
+        return self.usage_tracker.count_tokens(text, model)
+    
+    def count_message_tokens(self, messages: List[Dict[str, str]], model: Optional[str] = None) -> int:
+        """
+        Count tokens in messages using the appropriate tokenizer.
+        
+        Args:
+            messages: List of message dictionaries
+            model: Model name. If None, uses default_model.
+            
+        Returns:
+            Number of tokens
+        """
+        model = model or self.default_model
+        if model is None:
+            raise ValueError("No model provided and no default_model set")
+        return self.usage_tracker.count_message_tokens(messages, model)
+    
+    def estimate_cost(self, messages: List[Dict[str, str]], model: Optional[str] = None, 
+                     estimated_completion_tokens: int = 100) -> Dict[str, Any]:
+        """
+        Estimate the cost of a request before making it.
+        
+        Args:
+            messages: List of message dictionaries
+            model: Model name. If None, uses default_model.
+            estimated_completion_tokens: Estimated number of completion tokens
+            
+        Returns:
+            Dictionary with cost estimates
+        """
+        model = model or self.default_model
+        if model is None:
+            raise ValueError("No model provided and no default_model set")
+        
+        prompt_tokens = self.count_message_tokens(messages, model)
+        prompt_cost, completion_cost, total_cost = self.usage_tracker.calculate_token_costs(
+            model, prompt_tokens, estimated_completion_tokens
+        )
+        
+        return {
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "estimated_completion_tokens": estimated_completion_tokens,
+            "estimated_total_tokens": prompt_tokens + estimated_completion_tokens,
+            "prompt_cost": prompt_cost,
+            "completion_cost": completion_cost,
+            "total_cost": total_cost,
+        }
+    
+    def get_model_info(self, model: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get comprehensive information about a model.
+        
+        Args:
+            model: Model name. If None, uses default_model.
+            
+        Returns:
+            Dictionary with model information
+        """
+        model = model or self.default_model
+        if model is None:
+            raise ValueError("No model provided and no default_model set")
+        
+        cost_info = self.usage_tracker.get_model_cost_info(model)
+        
+        return {
+            "model": model,
+            "cost_info": cost_info,
+            "provider": get_llm_provider(model) if model else "unknown"
+        }
+    
+    def register_custom_model(self, model_name: str, cost_dict: Dict[str, Any]) -> bool:
+        """
+        Register a custom model with cost information.
+        
+        Args:
+            model_name: Name of the model to register
+            cost_dict: Dictionary with cost information
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        return self.usage_tracker.register_custom_model(model_name, cost_dict)
 
 
 # Convenience functions for quick usage
@@ -733,7 +876,36 @@ if __name__ == "__main__":
         default_api_base=None  # Use default OpenAI API base
     )
     
+    # Example: Token counting and cost estimation
+    sample_text = "Hello, how are you today?"
+    messages = [{"role": "user", "content": sample_text}]
+    
+    print("=== Token Counting and Cost Estimation ===")
+    token_count = client.count_tokens(sample_text)
+    message_token_count = client.count_message_tokens(messages)
+    print(f"Text tokens: {token_count}")
+    print(f"Message tokens: {message_token_count}")
+    
+    # Cost estimation
+    cost_estimate = client.estimate_cost(messages, estimated_completion_tokens=50)
+    print(f"Cost estimate: ${cost_estimate['total_cost']:.6f}")
+    print(f"  - Prompt cost: ${cost_estimate['prompt_cost']:.6f}")
+    print(f"  - Completion cost: ${cost_estimate['completion_cost']:.6f}")
+    
+    # Model information
+    model_info = client.get_model_info()
+    print(f"Model info: {model_info}")
+    
+    # Example: Encoding and decoding
+    print("\n=== Encoding and Decoding ===")
+    tokens = client.usage_tracker.encode_text(sample_text, "gpt-3.5-turbo")
+    decoded_text = client.usage_tracker.decode_tokens(tokens, "gpt-3.5-turbo")
+    print(f"Original: {sample_text}")
+    print(f"Decoded: {decoded_text}")
+    print(f"Tokens: {tokens[:10]}...")  # Show first 10 tokens
+    
     # Example chat completion using default model and parameters
+    print("\n=== Chat Completion ===")
     try:
         response = client.chat_completion(
             messages=[
@@ -745,6 +917,7 @@ if __name__ == "__main__":
         print(f"Error: {e}")
     
     # Example text completion with overridden temperature
+    print("\n=== Text Completion ===")
     try:
         response = client.text_completion(
             prompt="Write a short poem about coding",
@@ -755,10 +928,13 @@ if __name__ == "__main__":
         print(f"Error: {e}")
     
     # Get usage statistics
+    print("\n=== Usage Statistics ===")
     stats = client.get_usage_stats()
     print(f"Total requests: {stats.total_requests}")
     print(f"Total cost: ${stats.total_cost:.4f}")
+    print(f"Success rate: {stats.success_rate:.1%}")
     
     # Save usage data
     client.save_usage_data()
+    print("Usage data saved!")
 
