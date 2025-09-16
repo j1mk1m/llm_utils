@@ -1194,6 +1194,114 @@ class TestLogging(unittest.TestCase):
             self.assertIn("Making LLM request", log_content)
 
 
+class TestUsageCheckpointsTracker(unittest.TestCase):
+    """Tests for checkpoint functionality on LLMUsageTracker."""
+    
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.temp_file = os.path.join(self.temp_dir, "checkpoint_usage.json")
+        self.tracker = LLMUsageTracker(self.temp_file)
+    
+    def tearDown(self):
+        if os.path.exists(self.temp_file):
+            os.remove(self.temp_file)
+        os.rmdir(self.temp_dir)
+    
+    def test_basic_checkpoint(self):
+        """Start/end a single checkpoint and verify aggregated stats."""
+        self.tracker.start_usage_checkpoint("A")
+        # Two successful events inside A
+        self.tracker.track_usage("gpt-4", "openai", 10, 5, 15, 0.001, response_time=1.0)
+        self.tracker.track_usage("gpt-3.5-turbo", "openai", 8, 4, 12, 0.0008, response_time=0.8)
+        # One event outside A
+        self.tracker.end_usage_checkpoint("A")
+        self.tracker.track_usage("claude-3", "anthropic", 9, 3, 12, 0.0009, response_time=1.2)
+        
+        agg = self.tracker.get_checkpoint_usage("A")
+        self.assertEqual(agg.total_requests, 2)
+        self.assertEqual(agg.total_tokens, 27)
+        self.assertAlmostEqual(agg.total_cost, 0.0018, places=6)
+        self.assertIn("gpt-4", agg.model_breakdown)
+        self.assertIn("gpt-3.5-turbo", agg.model_breakdown)
+        self.assertNotIn("claude-3", agg.model_breakdown)
+    
+    def test_nested_and_repeated_checkpoints(self):
+        """Support nested checkpoints and multiple start/end cycles for the same name."""
+        # Outer begins
+        self.tracker.start_usage_checkpoint("outer")
+        self.tracker.track_usage("gpt-4", "openai", 10, 0, 10, 0.0005, response_time=0.5)
+        
+        # Inner nested
+        self.tracker.start_usage_checkpoint("inner")
+        self.tracker.track_usage("gpt-4", "openai", 5, 5, 10, 0.0007, response_time=0.6)
+        self.tracker.track_usage("claude-3", "anthropic", 6, 4, 10, 0.0006, response_time=0.7)
+        self.tracker.end_usage_checkpoint("inner")
+        
+        # Back to outer only
+        self.tracker.track_usage("gpt-3.5-turbo", "openai", 4, 3, 7, 0.0003, response_time=0.4)
+        self.tracker.end_usage_checkpoint("outer")
+        
+        # Re-open outer (repeated name) for additional interval
+        self.tracker.start_usage_checkpoint("outer")
+        self.tracker.track_usage("gpt-4", "openai", 3, 2, 5, 0.0002, response_time=0.3)
+        self.tracker.end_usage_checkpoint("outer")
+        
+        inner_agg = self.tracker.get_checkpoint_usage("inner")
+        self.assertEqual(inner_agg.total_requests, 2)
+        self.assertEqual(inner_agg.total_tokens, 20)
+        
+        outer_agg = self.tracker.get_checkpoint_usage("outer")
+        # First outer interval has 1 + 2 + 1 = 4 events, second interval has 1 event => 5 total
+        self.assertEqual(outer_agg.total_requests, 5)
+        self.assertEqual(outer_agg.total_tokens, 10 + 10 + 10 + 7 + 5)
+
+
+class TestUsageCheckpointsClient(unittest.TestCase):
+    """Tests for checkpoint functionality via LLMClient convenience methods."""
+    
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.temp_file = os.path.join(self.temp_dir, "checkpoint_client_usage.json")
+        self.tracker = LLMUsageTracker(self.temp_file)
+        self.client = LLMClient(self.tracker)
+    
+    def tearDown(self):
+        if os.path.exists(self.temp_file):
+            os.remove(self.temp_file)
+        os.rmdir(self.temp_dir)
+    
+    def test_client_checkpoint_summary(self):
+        """Use client API to start/end and get formatted summary dict."""
+        self.client.start_usage_checkpoint("part1")
+        # Add usage directly to underlying tracker; checkpointing is index-based
+        self.client.usage_tracker.track_usage("gpt-4", "openai", 12, 3, 15, 0.0009, response_time=0.9)
+        self.client.usage_tracker.track_usage("gpt-3.5-turbo", "openai", 7, 2, 9, 0.0004, response_time=0.7)
+        self.client.end_usage_checkpoint("part1")
+        # Outside checkpoint
+        self.client.usage_tracker.track_usage("claude-3", "anthropic", 5, 5, 10, 0.0008, response_time=0.8)
+        
+        summary = self.client.get_checkpoint_usage("part1")
+        self.assertEqual(summary["total_requests"], 2)
+        self.assertEqual(summary["total_tokens"], 24)
+        self.assertTrue(summary["total_cost"].startswith("$"))
+        self.assertIn("top_models", summary)
+        self.assertIn("top_providers", summary)
+        
+    def test_open_checkpoint_included_until_now(self):
+        """An active checkpoint should include events up to the current moment."""
+        self.client.start_usage_checkpoint("open")
+        self.client.usage_tracker.track_usage("gpt-4", "openai", 2, 2, 4, 0.0001, response_time=0.2)
+        # Do not end; query while open
+        summary = self.client.get_checkpoint_usage("open")
+        self.assertEqual(summary["total_requests"], 1)
+        self.assertEqual(summary["total_tokens"], 4)
+        # End and confirm still at least those events
+        self.client.end_usage_checkpoint("open")
+        summary2 = self.client.get_checkpoint_usage("open")
+        self.assertGreaterEqual(summary2["total_requests"], 1)
+        self.assertGreaterEqual(summary2["total_tokens"], 4)
+
+
 if __name__ == '__main__':
     # Run the tests
     unittest.main(verbosity=2)

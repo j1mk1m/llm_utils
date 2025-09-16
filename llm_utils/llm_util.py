@@ -154,6 +154,9 @@ class LLMUsageTracker:
         self.usage_data: List[UsageData] = []
         self.lock = threading.Lock()
         self.logger = logger or get_logger("llm_utils.tracker")
+        # Checkpoint tracking structures
+        self._checkpoint_stacks: Dict[str, List[int]] = defaultdict(list)
+        self._checkpoint_ranges: Dict[str, List[tuple[int, int]]] = defaultdict(list)
         
         # Load existing data if file exists
         self.load_usage_data()
@@ -346,6 +349,144 @@ class LLMUsageTracker:
             "end": max(timestamps).isoformat() if timestamps else ""
         }
         
+        return UsageAggregate(
+            total_requests=total_requests,
+            total_tokens=total_tokens,
+            total_cost=total_cost,
+            total_prompt_tokens=total_prompt_tokens,
+            total_completion_tokens=total_completion_tokens,
+            average_response_time=average_response_time,
+            success_rate=success_rate,
+            model_breakdown=dict(model_breakdown),
+            provider_breakdown=dict(provider_breakdown),
+            time_range=time_range
+        )
+
+    def start_usage_checkpoint(self, name: str) -> None:
+        """
+        Start a usage checkpoint identified by name.
+
+        Supports nested checkpoints by maintaining a stack per name.
+        """
+        with self.lock:
+            self._checkpoint_stacks[name].append(len(self.usage_data))
+            self.logger.debug(f"Started usage checkpoint '{name}' at index {self._checkpoint_stacks[name][-1]}")
+
+    def end_usage_checkpoint(self, name: str) -> None:
+        """
+        End a usage checkpoint identified by name.
+
+        Records the range [start_index, end_index) of usage events for this checkpoint.
+        """
+        with self.lock:
+            if name not in self._checkpoint_stacks or not self._checkpoint_stacks[name]:
+                raise ValueError(f"No active checkpoint to end for name '{name}'")
+            start_index = self._checkpoint_stacks[name].pop()
+            end_index = len(self.usage_data)
+            self._checkpoint_ranges[name].append((start_index, end_index))
+            self.logger.debug(f"Ended usage checkpoint '{name}' from {start_index} to {end_index}")
+
+    def get_checkpoint_usage(self, name: str) -> UsageAggregate:
+        """
+        Get aggregated usage statistics for a named checkpoint.
+
+        If multiple intervals were recorded for the checkpoint name, aggregates
+        across the union of those intervals (deduplicated indices).
+        """
+        with self.lock:
+            ranges = list(self._checkpoint_ranges.get(name, []))
+            # If there is an open (not yet ended) checkpoint for this name,
+            # include it up to the current end of usage_data.
+            if name in self._checkpoint_stacks and self._checkpoint_stacks[name]:
+                for start_index in self._checkpoint_stacks[name]:
+                    ranges.append((start_index, len(self.usage_data)))
+
+            if not ranges:
+                return UsageAggregate(
+                    total_requests=0,
+                    total_tokens=0,
+                    total_cost=0.0,
+                    total_prompt_tokens=0,
+                    total_completion_tokens=0,
+                    average_response_time=0.0,
+                    success_rate=0.0,
+                    model_breakdown={},
+                    provider_breakdown={},
+                    time_range={"start": "", "end": ""}
+                )
+
+            # Build a deduplicated set of indices covered by any interval
+            covered_indices = set()
+            for start_idx, end_idx in ranges:
+                if start_idx < 0:
+                    start_idx = 0
+                if end_idx < 0:
+                    end_idx = 0
+                if start_idx > end_idx:
+                    start_idx, end_idx = end_idx, start_idx
+                covered_indices.update(range(start_idx, min(end_idx, len(self.usage_data))))
+
+            filtered_data = [self.usage_data[i] for i in sorted(covered_indices)]
+
+        # Reuse aggregation logic on the filtered_data (outside lock)
+        if not filtered_data:
+            return UsageAggregate(
+                total_requests=0,
+                total_tokens=0,
+                total_cost=0.0,
+                total_prompt_tokens=0,
+                total_completion_tokens=0,
+                average_response_time=0.0,
+                success_rate=0.0,
+                model_breakdown={},
+                provider_breakdown={},
+                time_range={"start": "", "end": ""}
+            )
+
+        total_requests = len(filtered_data)
+        total_tokens = sum(d.total_tokens for d in filtered_data)
+        total_cost = sum(d.cost for d in filtered_data)
+        total_prompt_tokens = sum(d.prompt_tokens for d in filtered_data)
+        total_completion_tokens = sum(d.completion_tokens for d in filtered_data)
+
+        response_times = [d.response_time for d in filtered_data if d.response_time is not None]
+        average_response_time = sum(response_times) / len(response_times) if response_times else 0.0
+
+        successful_requests = sum(1 for d in filtered_data if d.success)
+        success_rate = successful_requests / total_requests if total_requests > 0 else 0.0
+
+        model_breakdown = defaultdict(lambda: {
+            'requests': 0, 'tokens': 0, 'cost': 0.0, 'avg_response_time': 0.0
+        })
+        for data in filtered_data:
+            model_breakdown[data.model]['requests'] += 1
+            model_breakdown[data.model]['tokens'] += data.total_tokens
+            model_breakdown[data.model]['cost'] += data.cost
+            if data.response_time is not None:
+                model_breakdown[data.model]['avg_response_time'] += data.response_time
+        for model_data in model_breakdown.values():
+            if model_data['requests'] > 0:
+                model_data['avg_response_time'] /= model_data['requests']
+
+        provider_breakdown = defaultdict(lambda: {
+            'requests': 0, 'tokens': 0, 'cost': 0.0, 'avg_response_time': 0.0
+        })
+        for data in filtered_data:
+            provider_breakdown[data.provider]['requests'] += 1
+            provider_breakdown[data.provider]['tokens'] += data.total_tokens
+            provider_breakdown[data.provider]['cost'] += data.cost
+            if data.response_time is not None:
+                provider_breakdown[data.provider]['avg_response_time'] += data.response_time
+        for provider_data in provider_breakdown.values():
+            if provider_data['requests'] > 0:
+                provider_data['avg_response_time'] /= provider_data['requests']
+
+        timestamps = [datetime.fromisoformat(d.timestamp.replace('Z', '+00:00')) for d in filtered_data]
+        time_range = {
+            "start": min(timestamps).isoformat() if timestamps else "",
+            "end": max(timestamps).isoformat() if timestamps else ""
+        }
+
         return UsageAggregate(
             total_requests=total_requests,
             total_tokens=total_tokens,
@@ -804,6 +945,34 @@ class LLMClient:
             True if successful, False otherwise
         """
         return self.usage_tracker.register_custom_model(model_name, cost_dict)
+
+    # Checkpoint APIs
+    def start_usage_checkpoint(self, name: str) -> None:
+        """
+        Start a named usage checkpoint on the underlying tracker.
+        """
+        self.usage_tracker.start_usage_checkpoint(name)
+
+    def end_usage_checkpoint(self, name: str) -> None:
+        """
+        End a named usage checkpoint on the underlying tracker.
+        """
+        self.usage_tracker.end_usage_checkpoint(name)
+
+    def get_checkpoint_usage(self, name: str) -> Dict[str, Any]:
+        """
+        Get a human-friendly summary dict for a checkpoint, mirroring get_usage_summary.
+        """
+        stats = self.usage_tracker.get_checkpoint_usage(name)
+        return {
+            "total_requests": stats.total_requests,
+            "total_tokens": stats.total_tokens,
+            "total_cost": f"${stats.total_cost:.4f}",
+            "average_response_time": f"{stats.average_response_time:.2f}s",
+            "success_rate": f"{stats.success_rate:.1%}",
+            "top_models": sorted(stats.model_breakdown.items(), key=lambda x: x[1]['requests'], reverse=True)[:5],
+            "top_providers": sorted(stats.provider_breakdown.items(), key=lambda x: x[1]['requests'], reverse=True)[:5],
+        }
 
 
 # Convenience functions for quick usage

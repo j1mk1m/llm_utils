@@ -178,6 +178,40 @@ summary = get_usage_summary(client)
 # }
 ```
 
+## Usage Tracking with checkpoints
+```python
+from llm_utils.llm_util import create_llm_client, get_usage_summary
+
+# Create client
+client = create_llm_client(default_model="gpt-3.5-turbo")
+
+# First part 
+client.start_usage_checkpoint("first")
+for i in range(3):
+    response = client.chat_completion([
+        {"role": "user", "content": f"Tell me about topic {i+1}"}
+    ])
+client.end_usage_checkpoint("first")
+
+# Second part (with nested checkpointing)
+client.start_usage_checkpoint("second")
+for i in range(3):
+    client.start_usage_checkpoint(f"second_loop_iteration_{i+1}")
+    response = client.chat_completion([
+        {"role": "user", "content": f"Tell me again about topic {i+1}"}
+    ])
+    client.end_usage_checkpoint(f"second_loop_iteration_{i+1}")
+client.end_usage_checkpoint("second")
+
+# Get usage summary
+stats = client.get_checkpoint_usage("first")
+print(f"Total requests for first part: {stats['total_requests']}")
+stats = client.get_checkpoint_usage("second")
+print(f"Total requests for second part: {stats['total_requests']}")
+stats = client.get_checkpoint_usage("second_loop_iteration_1")
+print(f"Total requests for second part iteration 1: {stats['total_requests']}")
+```
+
 ## Usage Examples
 
 ### Chat Completion
