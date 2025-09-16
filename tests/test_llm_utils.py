@@ -453,7 +453,7 @@ class TestLLMClient(unittest.TestCase):
         self.assertEqual(usage.provider, "openai")
         self.assertTrue(usage.success)
     
-    @patch('llm_utils.llm_util.completion')
+    @patch('llm_utils.llm_util.text_completion')
     @patch('llm_utils.llm_util.litellm_get_total_cost')
     @patch('llm_utils.llm_util.token_counter')
     @patch('llm_utils.llm_util.get_llm_provider')
@@ -462,7 +462,7 @@ class TestLLMClient(unittest.TestCase):
         # Mock responses
         mock_get_provider.return_value = "openai"
         mock_completion.return_value = {
-            'choices': [{'message': {'content': 'Hello world!'}}],
+            'choices': [{'text': 'Hello world!'}],
             'usage': {'prompt_tokens': 5, 'completion_tokens': 3, 'total_tokens': 8}
         }
         mock_completion_cost.return_value = 0.0005  # Now returns float
@@ -470,7 +470,7 @@ class TestLLMClient(unittest.TestCase):
         
         response = self.client.text_completion("Hello", model="gpt-3.5-turbo")
         
-        self.assertEqual(response['choices'][0]['message']['content'], 'Hello world!')
+        self.assertEqual(response['choices'][0]['text'], 'Hello world!')
         mock_completion.assert_called_once()
         
         # Check that usage was tracked
@@ -624,7 +624,7 @@ class TestDefaultParameters(unittest.TestCase):
         self.assertEqual(call_args[1]['max_tokens'], 1000)
         self.assertEqual(call_args[1]['api_base'], "https://api.openai.com/v1")
     
-    @patch('llm_utils.llm_util.completion')
+    @patch('llm_utils.llm_util.text_completion')
     @patch('llm_utils.llm_util.litellm_get_total_cost')
     @patch('llm_utils.llm_util.token_counter')
     @patch('llm_utils.llm_util.get_llm_provider')
@@ -632,7 +632,7 @@ class TestDefaultParameters(unittest.TestCase):
         """Test text completion using all default parameters."""
         mock_get_provider.return_value = "openai"
         mock_completion.return_value = {
-            'choices': [{'message': {'content': 'Hello world!'}}],
+            'choices': [{'text': 'Hello world!'}],
             'usage': {'prompt_tokens': 5, 'completion_tokens': 3, 'total_tokens': 8}
         }
         mock_completion_cost.return_value = 0.0005  # Now returns float
@@ -640,7 +640,7 @@ class TestDefaultParameters(unittest.TestCase):
         
         response = self.client.text_completion("Hello")
         
-        self.assertEqual(response['choices'][0]['message']['content'], 'Hello world!')
+        self.assertEqual(response['choices'][0]['text'], 'Hello world!')
         
         # Check that completion was called with default parameters
         mock_completion.assert_called_once()
@@ -770,6 +770,148 @@ class TestDefaultParameters(unittest.TestCase):
         self.assertEqual(call_args[1]['temperature'], 0.8)
         self.assertNotIn('max_tokens', call_args[1])
         self.assertNotIn('api_base', call_args[1])
+
+
+class TestRefactoredSharedMethods(unittest.TestCase):
+    """Test cases for the refactored shared methods in LLMClient."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.temp_file = os.path.join(self.temp_dir, "refactored_test.json")
+        self.tracker = LLMUsageTracker(self.temp_file)
+        self.client = LLMClient(
+            self.tracker,
+            default_model="gpt-3.5-turbo",
+            default_temperature=0.7,
+            default_max_tokens=1000,
+            default_api_base="https://api.openai.com/v1"
+        )
+    
+    def tearDown(self):
+        """Clean up test fixtures."""
+        if os.path.exists(self.temp_file):
+            os.remove(self.temp_file)
+        os.rmdir(self.temp_dir)
+    
+    def test_prepare_request_without_defaults(self):
+        """Test _prepare_request method without default parameters."""
+        client_no_defaults = LLMClient(self.tracker)
+        
+        with self.assertRaises(ValueError):
+            client_no_defaults._prepare_request(None)
+    
+    def test_prepare_request_with_model_override(self):
+        """Test _prepare_request method with model override."""
+        model, provider, merged_kwargs = self.client._prepare_request("gpt-4", temperature=0.5)
+        
+        self.assertEqual(model, "gpt-4")
+        self.assertEqual(merged_kwargs['temperature'], 0.5)
+        self.assertEqual(merged_kwargs['max_tokens'], 1000)  # Still uses default
+    
+    def test_log_response_content_chat_completion(self):
+        """Test _log_response_content method for chat completion."""
+        response = {
+            'choices': [{'message': {'content': 'Hello from chat completion!'}}]
+        }
+        
+        # This should not raise an exception
+        self.client._log_response_content(response, "chat completion")
+    
+    def test_log_response_content_text_completion(self):
+        """Test _log_response_content method for text completion."""
+        response = {
+            'choices': [{'text': 'Hello from text completion!'}]
+        }
+        
+        # This should not raise an exception
+        self.client._log_response_content(response, "text completion")
+    
+    def test_log_response_content_empty_choices(self):
+        """Test _log_response_content method with empty choices."""
+        response = {'choices': []}
+        
+        # This should not raise an exception
+        self.client._log_response_content(response, "test")
+    
+    def test_log_response_content_no_choices(self):
+        """Test _log_response_content method with no choices key."""
+        response = {}
+        
+        # This should not raise an exception
+        self.client._log_response_content(response, "test")
+    
+    @patch('llm_utils.llm_util.completion')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_shared_execute_request_with_retry_chat(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
+        """Test _execute_request_with_retry method with chat completion."""
+        mock_get_provider.return_value = "openai"
+        mock_completion.return_value = {
+            'choices': [{'message': {'content': 'Hello!'}}],
+            'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
+        }
+        mock_completion_cost.return_value = 0.001
+        mock_token_counter.side_effect = [10, 5]
+        
+        def request_func():
+            from llm_utils.llm_util import completion
+            return completion(model="gpt-3.5-turbo", messages=[{"role": "user", "content": "Hello"}])
+        
+        def calculate_tokens(model, response, merged_kwargs):
+            return 10, 5, 15
+        
+        # Temporarily override the token calculation method
+        original_calculate = self.client._calculate_tokens_for_response
+        self.client._calculate_tokens_for_response = calculate_tokens
+        
+        try:
+            response = self.client._execute_request_with_retry(
+                "gpt-3.5-turbo", "openai", {}, request_func, "chat completion"
+            )
+            
+            self.assertEqual(response['choices'][0]['message']['content'], 'Hello!')
+            self.assertEqual(len(self.tracker.usage_data), 1)
+        finally:
+            # Restore original method
+            self.client._calculate_tokens_for_response = original_calculate
+    
+    @patch('llm_utils.llm_util.text_completion')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_shared_execute_request_with_retry_text(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
+        """Test _execute_request_with_retry method with text completion."""
+        mock_get_provider.return_value = "openai"
+        mock_completion.return_value = {
+            'choices': [{'text': 'Hello world!'}],
+            'usage': {'prompt_tokens': 5, 'completion_tokens': 3, 'total_tokens': 8}
+        }
+        mock_completion_cost.return_value = 0.0005
+        mock_token_counter.side_effect = [5, 3]
+        
+        def request_func():
+            from llm_utils.llm_util import text_completion
+            return text_completion(model="gpt-3.5-turbo", prompt="Hello")
+        
+        def calculate_tokens(model, response, merged_kwargs):
+            return 5, 3, 8
+        
+        # Temporarily override the token calculation method
+        original_calculate = self.client._calculate_tokens_for_response
+        self.client._calculate_tokens_for_response = calculate_tokens
+        
+        try:
+            response = self.client._execute_request_with_retry(
+                "gpt-3.5-turbo", "openai", {}, request_func, "text completion"
+            )
+            
+            self.assertEqual(response['choices'][0]['text'], 'Hello world!')
+            self.assertEqual(len(self.tracker.usage_data), 1)
+        finally:
+            # Restore original method
+            self.client._calculate_tokens_for_response = original_calculate
 
 
 class TestConvenienceFunctions(unittest.TestCase):
@@ -1040,8 +1182,8 @@ class TestLogging(unittest.TestCase):
             with open(self.temp_file, 'r') as f:
                 log_content = f.read()
             
-            self.assertIn("Making LLM request to gpt-3.5-turbo", log_content)
-            self.assertIn("LLM request successful", log_content)
+            self.assertIn("Making LLM chat completion to gpt-3.5-turbo", log_content)
+            self.assertIn("LLM chat completion successful", log_content)
             self.assertIn("openai", log_content)
     
     def test_client_debug_logging(self):
@@ -1104,7 +1246,7 @@ class TestLogging(unittest.TestCase):
             with open(self.temp_file, 'r') as f:
                 log_content = f.read()
             
-            self.assertIn("Unexpected error in LLM request", log_content)
+            self.assertIn("Unexpected error in LLM chat completion", log_content)
             self.assertIn("API Error", log_content)
     
     def test_retry_logging(self):
@@ -1191,7 +1333,7 @@ class TestLogging(unittest.TestCase):
                 log_content = f.read()
             
             self.assertIn("custom_test_logger", log_content)
-            self.assertIn("Making LLM request", log_content)
+            self.assertIn("Making LLM chat completion", log_content)
 
 
 class TestUsageCheckpointsTracker(unittest.TestCase):

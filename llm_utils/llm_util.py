@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Union, Literal
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 
-from litellm import completion, get_llm_provider, token_counter, cost_per_token
+from litellm import completion, text_completion, get_llm_provider, token_counter, cost_per_token
 from litellm import completion_cost as litellm_get_total_cost
 from litellm.exceptions import RateLimitError, APIConnectionError, APIError
 
@@ -687,24 +687,17 @@ class LLMClient:
         self.default_api_base = default_api_base
         self.logger = logger or get_logger("llm_utils.client")
     
-    def _make_request(self, 
-                     messages: List[Dict[str, str]],
-                     model: Optional[str] = None,
-                     **kwargs) -> Dict[str, Any]:
+    def _prepare_request(self, model: Optional[str], **kwargs) -> tuple[str, str, Dict[str, Any]]:
         """
-        Make an LLM request with retry logic and usage tracking.
+        Prepare common request parameters and validation.
         
         Args:
-            messages: List of message dictionaries
-            model: The model to use (e.g., 'gpt-4', 'claude-3-sonnet'). If None, uses default_model.
-            **kwargs: Additional arguments for the completion call
+            model: The model to use. If None, uses default_model.
+            **kwargs: Additional arguments for the request
             
         Returns:
-            Response dictionary from LiteLLM
+            Tuple of (model, provider, merged_kwargs)
         """
-        start_time = time.time()
-        request_id = kwargs.get('request_id')
-        
         # Use default model if not provided
         if model is None:
             if self.default_model is None:
@@ -731,12 +724,35 @@ class LLMClient:
         except Exception:
             provider = "unknown"
         
+        return model, provider, merged_kwargs
+    
+    def _execute_request_with_retry(self, 
+                                   model: str, 
+                                   provider: str, 
+                                   merged_kwargs: Dict[str, Any],
+                                   request_func,
+                                   request_type: str = "request") -> Dict[str, Any]:
+        """
+        Execute a request with retry logic and usage tracking.
+        
+        Args:
+            model: The model name
+            provider: The provider name
+            merged_kwargs: Merged request parameters
+            request_func: Function to call for the actual request
+            request_type: Type of request for logging (e.g., "chat completion", "text completion")
+            
+        Returns:
+            Response dictionary from LiteLLM
+        """
+        start_time = time.time()
+        request_id = merged_kwargs.get('request_id')
+        
         # Log request details
-        self.logger.info(f"Making LLM request to {model} ({provider})" + 
+        self.logger.info(f"Making LLM {request_type} to {model} ({provider})" + 
                         (f" with request_id: {request_id}" if request_id else ""))
         
-        # Log prompts in debug mode
-        self.logger.debug(f"Request messages: {messages}")
+        # Log request details in debug mode
         self.logger.debug(f"Request parameters: {merged_kwargs}")
         
         # Retry logic
@@ -746,20 +762,16 @@ class LLMClient:
                 if attempt > 0:
                     self.logger.info(f"Retry attempt {attempt + 1}/{self.default_retry_attempts} for {model}")
                 
-                response = completion(
-                    model=model,
-                    messages=messages,
-                    **merged_kwargs
-                )
+                response = request_func()
                 
                 # Track successful usage
                 response_time = time.time() - start_time
                 total_cost = litellm_get_total_cost(response)
                 
-                # Get detailed cost breakdown
-                prompt_tokens = token_counter(model=model, messages=messages)
-                completion_tokens = token_counter(model=model, messages=[response['choices'][0]['message']])
-                total_tokens = prompt_tokens + completion_tokens
+                # Get detailed cost breakdown - this will be customized by the calling method
+                prompt_tokens, completion_tokens, total_tokens = self._calculate_tokens_for_response(
+                    model, response, merged_kwargs
+                )
                 
                 # Calculate detailed costs
                 prompt_cost, completion_cost, _= self.usage_tracker.calculate_token_costs(
@@ -782,16 +794,13 @@ class LLMClient:
                 
                 # Log successful response
                 response_time_str = f"{response_time:.2f}s" if response_time is not None else "N/A"
-                self.logger.info(f"LLM request successful: {model} - "
+                self.logger.info(f"LLM {request_type} successful: {model} - "
                                f"tokens: {total_tokens}, "
                                f"cost: ${total_cost:.4f}, "
                                f"response_time: {response_time_str}")
                 
                 # Log response content in debug mode
-                if 'choices' in response and response['choices']:
-                    response_content = response['choices'][0].get('message', {}).get('content', '')
-                    if response_content:
-                        self.logger.debug(f"Response content: {response_content[:200]}{'...' if len(response_content) > 200 else ''}")
+                self._log_response_content(response, request_type)
                 
                 return response
                 
@@ -819,7 +828,7 @@ class LLMClient:
                         success=False,
                         error_message=str(e)
                     )
-                    self.logger.error(f"LLM request failed after {self.default_retry_attempts} attempts: {type(e).__name__}: {e}")
+                    self.logger.error(f"LLM {request_type} failed after {self.default_retry_attempts} attempts: {type(e).__name__}: {e}")
                     raise e
             except Exception as e:
                 # Track unexpected errors
@@ -836,11 +845,89 @@ class LLMClient:
                     success=False,
                     error_message=str(e)
                 )
-                self.logger.error(f"Unexpected error in LLM request: {type(e).__name__}: {e}")
+                self.logger.error(f"Unexpected error in LLM {request_type}: {type(e).__name__}: {e}")
                 raise e
         
         # This should never be reached, but just in case
         raise last_exception or Exception("Unknown error occurred")
+    
+    def _calculate_tokens_for_response(self, model: str, response: Dict[str, Any], merged_kwargs: Dict[str, Any]) -> tuple[int, int, int]:
+        """
+        Calculate token counts for a response. This is a placeholder that should be overridden
+        by the calling method to handle different response types.
+        
+        Args:
+            model: The model name
+            response: The response from LiteLLM
+            merged_kwargs: The request parameters
+            
+        Returns:
+            Tuple of (prompt_tokens, completion_tokens, total_tokens)
+        """
+        # This should be overridden by the calling method
+        return 0, 0, 0
+    
+    def _log_response_content(self, response: Dict[str, Any], request_type: str) -> None:
+        """
+        Log response content in debug mode.
+        
+        Args:
+            response: The response from LiteLLM
+            request_type: Type of request for logging
+        """
+        if 'choices' in response and response['choices']:
+            if request_type == "text completion":
+                response_content = response['choices'][0].get('text', '')
+            else:
+                response_content = response['choices'][0].get('message', {}).get('content', '')
+            
+            if response_content:
+                self.logger.debug(f"Response content: {response_content[:200]}{'...' if len(response_content) > 200 else ''}")
+
+    def _make_request(self, 
+                     messages: List[Dict[str, str]],
+                     model: Optional[str] = None,
+                     **kwargs) -> Dict[str, Any]:
+        """
+        Make an LLM request with retry logic and usage tracking.
+        
+        Args:
+            messages: List of message dictionaries
+            model: The model to use (e.g., 'gpt-4', 'claude-3-sonnet'). If None, uses default_model.
+            **kwargs: Additional arguments for the completion call
+            
+        Returns:
+            Response dictionary from LiteLLM
+        """
+        model, provider, merged_kwargs = self._prepare_request(model, **kwargs)
+        
+        # Log messages in debug mode
+        self.logger.debug(f"Request messages: {messages}")
+        
+        def request_func():
+            return completion(
+                model=model,
+                messages=messages,
+                **merged_kwargs
+            )
+        
+        def calculate_tokens(model, response, merged_kwargs):
+            prompt_tokens = token_counter(model=model, messages=messages)
+            completion_tokens = token_counter(model=model, messages=[response['choices'][0]['message']])
+            total_tokens = prompt_tokens + completion_tokens
+            return prompt_tokens, completion_tokens, total_tokens
+        
+        # Temporarily override the token calculation method
+        original_calculate = self._calculate_tokens_for_response
+        self._calculate_tokens_for_response = calculate_tokens
+        
+        try:
+            return self._execute_request_with_retry(
+                model, provider, merged_kwargs, request_func, "chat completion"
+            )
+        finally:
+            # Restore original method
+            self._calculate_tokens_for_response = original_calculate
     
     def chat_completion(self,
                        messages: List[Dict[str, str]],
@@ -869,13 +956,40 @@ class LLMClient:
         Args:
             prompt: The text prompt
             model: The model to use. If None, uses default_model.
-            **kwargs: Additional arguments for the completion call
+            **kwargs: Additional arguments for the text_completion call
             
         Returns:
             Response dictionary from LiteLLM
         """
-        messages = [{"role": "user", "content": prompt}]
-        return self._make_request(messages, model, **kwargs)
+        model, provider, merged_kwargs = self._prepare_request(model, **kwargs)
+        
+        # Log prompt in debug mode
+        self.logger.debug(f"Request prompt: {prompt}")
+        
+        def request_func():
+            return text_completion(
+                model=model,
+                prompt=prompt,
+                **merged_kwargs
+            )
+        
+        def calculate_tokens(model, response, merged_kwargs):
+            prompt_tokens = token_counter(model=model, prompt=prompt)
+            completion_tokens = token_counter(model=model, prompt=response['choices'][0]['text'])
+            total_tokens = prompt_tokens + completion_tokens
+            return prompt_tokens, completion_tokens, total_tokens
+        
+        # Temporarily override the token calculation method
+        original_calculate = self._calculate_tokens_for_response
+        self._calculate_tokens_for_response = calculate_tokens
+        
+        try:
+            return self._execute_request_with_retry(
+                model, provider, merged_kwargs, request_func, "text completion"
+            )
+        finally:
+            # Restore original method
+            self._calculate_tokens_for_response = original_calculate
     
     def get_usage_stats(self, **kwargs) -> UsageAggregate:
         """
@@ -1163,7 +1277,7 @@ if __name__ == "__main__":
             prompt="Write a short poem about coding",
             temperature=0.9  # Override default temperature
         )
-        print("Poem:", response['choices'][0]['message']['content'])
+        print("Poem:", response['choices'][0]['text'])
     except Exception as e:
         print(f"Error: {e}")
     
