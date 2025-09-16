@@ -118,8 +118,12 @@ client = LLMClient(
 - `chat_completion(messages, **kwargs)` - Chat completion requests
 - `text_completion(prompt, **kwargs)` - Text completion requests
 - `get_usage_stats(**kwargs)` - Get usage statistics
-- `save_usage_data(file_path)` - Save usage data to file
-- `load_usage_data(file_path)` - Load usage data from file
+- `save_usage_data(file_path)` - Save usage data to file (includes checkpoints)
+- `load_usage_data(file_path)` - Load usage data from file (supports checkpoints)
+- `export_usage_data(file_path, format, checkpoint_name)` - Export usage data
+- `start_usage_checkpoint(name)` - Start a usage checkpoint
+- `end_usage_checkpoint(name)` - End a usage checkpoint
+- `get_checkpoint_usage(name)` - Get checkpoint usage statistics
 
 #### `LLMUsageTracker`
 
@@ -132,8 +136,12 @@ tracker = LLMUsageTracker(data_file="usage.json")
 **Methods:**
 - `track_usage(...)` - Track a single usage event
 - `get_aggregated_usage(...)` - Get aggregated statistics
-- `save_usage_data(file_path)` - Save data to file
-- `load_usage_data(file_path)` - Load data from file
+- `save_usage_data(file_path)` - Save data to file (includes checkpoints)
+- `load_usage_data(file_path)` - Load data from file (supports checkpoints)
+- `export_usage_data(file_path, format, checkpoint_name)` - Export usage data
+- `start_usage_checkpoint(name)` - Start a usage checkpoint
+- `end_usage_checkpoint(name)` - End a usage checkpoint
+- `get_checkpoint_usage(name)` - Get checkpoint usage statistics
 
 ### Convenience Functions
 
@@ -212,6 +220,82 @@ stats = client.get_checkpoint_usage("second_loop_iteration_1")
 print(f"Total requests for second part iteration 1: {stats['total_requests']}")
 ```
 
+### Checkpoint Data Management
+
+The library provides comprehensive data management for checkpoints:
+
+#### Saving Checkpoint Data
+
+```python
+# Save all usage data including checkpoint information
+client.save_usage_data("usage_with_checkpoints.json")
+
+# The saved file includes:
+# - usage_data: All usage records
+# - checkpoint_ranges: Checkpoint index ranges
+# - checkpoint_stacks: Active checkpoint stacks
+# - metadata: Save timestamp and statistics
+```
+
+#### Exporting Checkpoint Data
+
+```python
+# Export all usage data
+client.export_usage_data("all_usage.json", format="json")
+
+# Export data for a specific checkpoint
+client.export_usage_data("first_checkpoint.json", format="json", checkpoint_name="first")
+client.export_usage_data("second_checkpoint.csv", format="csv", checkpoint_name="second")
+
+# Export nested checkpoint data
+client.export_usage_data("iteration_data.json", format="json", checkpoint_name="second_loop_iteration_1")
+```
+
+#### Loading Checkpoint Data
+
+```python
+# Load data with checkpoint information (new format)
+client.load_usage_data("usage_with_checkpoints.json")
+
+# Load legacy format data (backward compatible)
+client.load_usage_data("legacy_usage.json")
+
+# After loading, checkpoints are restored and available
+stats = client.get_checkpoint_usage("first")  # Works after loading
+```
+
+#### Checkpoint Data Structure
+
+The saved data structure includes:
+
+```json
+{
+  "usage_data": [
+    {
+      "timestamp": "2024-01-01T12:00:00Z",
+      "model": "gpt-3.5-turbo",
+      "provider": "openai",
+      "prompt_tokens": 10,
+      "completion_tokens": 5,
+      "total_tokens": 15,
+      "cost": 0.001,
+      "response_time": 1.0,
+      "success": true
+    }
+  ],
+  "checkpoint_ranges": {
+    "first": [[1, 3]],
+    "second": [[3, 6]]
+  },
+  "checkpoint_stacks": {},
+  "metadata": {
+    "saved_at": "2024-01-01T12:30:00Z",
+    "total_usage_records": 5,
+    "total_checkpoints": 2
+  }
+}
+```
+
 ## Usage Examples
 
 ### Chat Completion
@@ -288,13 +372,17 @@ gpt4_stats = client.get_usage_stats(model_filter="gpt-4")
 ### Data Export
 
 ```python
-# Save usage data
+# Save usage data (includes checkpoint information)
 client.save_usage_data("usage_backup.json")
 
-# Export to CSV
+# Export all usage data to CSV
 client.export_usage_data("usage_report.csv", format="csv")
 
-# Load historical data
+# Export data for a specific checkpoint
+client.export_usage_data("checkpoint_data.json", format="json", checkpoint_name="first")
+client.export_usage_data("checkpoint_data.csv", format="csv", checkpoint_name="second")
+
+# Load historical data (supports both old and new formats)
 client.load_usage_data("historical_usage.json")
 ```
 
@@ -419,3 +507,6 @@ MIT License - see LICENSE file for details.
 - Data persistence (JSON/CSV)
 - Thread-safe operations
 - Configurable retry logic
+- Usage checkpoints for tracking specific code sections
+- Checkpoint-aware data export and import
+- Backward compatibility with legacy data formats

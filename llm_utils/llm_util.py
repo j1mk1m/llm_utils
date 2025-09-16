@@ -502,7 +502,7 @@ class LLMUsageTracker:
     
     def save_usage_data(self, file_path: Optional[str] = None) -> None:
         """
-        Save usage data to a JSON file.
+        Save usage data to a JSON file including checkpoint information.
         
         Args:
             file_path: Optional custom file path. If None, uses the default data_file.
@@ -510,7 +510,16 @@ class LLMUsageTracker:
         save_path = file_path or self.data_file
         
         with self.lock:
-            data_to_save = [asdict(usage) for usage in self.usage_data]
+            data_to_save = {
+                "usage_data": [asdict(usage) for usage in self.usage_data],
+                "checkpoint_ranges": dict(self._checkpoint_ranges),
+                "checkpoint_stacks": dict(self._checkpoint_stacks),
+                "metadata": {
+                    "saved_at": datetime.now(timezone.utc).isoformat(),
+                    "total_usage_records": len(self.usage_data),
+                    "total_checkpoints": len(self._checkpoint_ranges)
+                }
+            }
         
         # Ensure directory exists
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -518,14 +527,14 @@ class LLMUsageTracker:
         try:
             with open(save_path, 'w') as f:
                 json.dump(data_to_save, f, indent=2)
-            self.logger.info(f"Saved {len(data_to_save)} usage records to {save_path}")
+            self.logger.info(f"Saved {len(self.usage_data)} usage records and {len(self._checkpoint_ranges)} checkpoints to {save_path}")
         except Exception as e:
             self.logger.error(f"Failed to save usage data to {save_path}: {e}")
             raise
     
     def load_usage_data(self, file_path: Optional[str] = None) -> None:
         """
-        Load usage data from a JSON file.
+        Load usage data from a JSON file including checkpoint information.
         
         Args:
             file_path: Optional custom file path. If None, uses the default data_file.
@@ -541,9 +550,33 @@ class LLMUsageTracker:
                 data = json.load(f)
             
             with self.lock:
-                self.usage_data = [UsageData(**item) for item in data]
-            self.logger.info(f"Loaded {len(self.usage_data)} usage records from {load_path}")
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
+                # Handle both old format (list) and new format (dict with checkpoint info)
+                if isinstance(data, list):
+                    # Old format - just usage data
+                    self.usage_data = [UsageData(**item) for item in data]
+                    self.logger.info(f"Loaded {len(self.usage_data)} usage records from {load_path} (legacy format)")
+                elif isinstance(data, dict) and "usage_data" in data:
+                    # New format - includes checkpoint information
+                    self.usage_data = [UsageData(**item) for item in data["usage_data"]]
+                    
+                    # Restore checkpoint information
+                    self._checkpoint_ranges = defaultdict(list, data.get("checkpoint_ranges", {}))
+                    self._checkpoint_stacks = defaultdict(list, data.get("checkpoint_stacks", {}))
+                    
+                    # Convert checkpoint_ranges keys back to tuples
+                    for name, ranges in self._checkpoint_ranges.items():
+                        self._checkpoint_ranges[name] = [tuple(r) for r in ranges]
+                    
+                    metadata = data.get("metadata", {})
+                    self.logger.info(
+                        f"Loaded {len(self.usage_data)} usage records and {len(self._checkpoint_ranges)} checkpoints from {load_path}"
+                    )
+                    if "saved_at" in metadata:
+                        self.logger.debug(f"Data was saved at: {metadata['saved_at']}")
+                else:
+                    raise ValueError("Invalid data format in file")
+                    
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             self.logger.warning(f"Could not load usage data from {load_path}: {e}")
             # Keep existing data if loading fails
     
@@ -552,16 +585,25 @@ class LLMUsageTracker:
         with self.lock:
             self.usage_data.clear()
     
-    def export_usage_data(self, file_path: str, format: Literal['json', 'csv'] = 'json') -> None:
+    def export_usage_data(self, file_path: str, format: Literal['json', 'csv'] = 'json', checkpoint_name: Optional[str] = None) -> None:
         """
         Export usage data in different formats.
         
         Args:
             file_path: Path to save the exported data
             format: Export format ('json' or 'csv')
+            checkpoint_name: Optional checkpoint name to export only data from that checkpoint
         """
         with self.lock:
-            data_to_export = [asdict(usage) for usage in self.usage_data]
+            if checkpoint_name:
+                # Get data for specific checkpoint
+                checkpoint_data = self._get_checkpoint_data(checkpoint_name)
+                data_to_export = [asdict(usage) for usage in checkpoint_data]
+                self.logger.info(f"Exporting {len(data_to_export)} usage records from checkpoint '{checkpoint_name}'")
+            else:
+                # Export all data
+                data_to_export = [asdict(usage) for usage in self.usage_data]
+                self.logger.info(f"Exporting {len(data_to_export)} usage records")
         
         # Ensure directory exists
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -576,6 +618,34 @@ class LLMUsageTracker:
                     writer = csv.DictWriter(f, fieldnames=data_to_export[0].keys())
                     writer.writeheader()
                     writer.writerows(data_to_export)
+    
+    def _get_checkpoint_data(self, checkpoint_name: str) -> List[UsageData]:
+        """
+        Get usage data for a specific checkpoint.
+        
+        Args:
+            checkpoint_name: Name of the checkpoint
+            
+        Returns:
+            List of UsageData objects for the checkpoint
+        """
+        ranges = list(self._checkpoint_ranges.get(checkpoint_name, []))
+        # If there is an open (not yet ended) checkpoint for this name,
+        # include it up to the current end of usage_data.
+        if checkpoint_name in self._checkpoint_stacks and self._checkpoint_stacks[checkpoint_name]:
+            for start_index in self._checkpoint_stacks[checkpoint_name]:
+                ranges.append((start_index, len(self.usage_data)))
+        
+        if not ranges:
+            return []
+        
+        # Collect all indices covered by the ranges
+        indices = set()
+        for start, end in ranges:
+            indices.update(range(start, end))
+        
+        # Return usage data for those indices
+        return [self.usage_data[i] for i in sorted(indices) if i < len(self.usage_data)]
 
 
 class LLMClient:
@@ -837,15 +907,16 @@ class LLMClient:
         """
         self.usage_tracker.load_usage_data(file_path)
     
-    def export_usage_data(self, file_path: str, format: Literal['json', 'csv'] = 'json') -> None:
+    def export_usage_data(self, file_path: str, format: Literal['json', 'csv'] = 'json', checkpoint_name: Optional[str] = None) -> None:
         """
         Export usage data in different formats.
         
         Args:
             file_path: Path to save the exported data
             format: Export format ('json' or 'csv')
+            checkpoint_name: Optional checkpoint name to export only data from that checkpoint
         """
-        self.usage_tracker.export_usage_data(file_path, format)
+        self.usage_tracker.export_usage_data(file_path, format, checkpoint_name)
     
     def count_tokens(self, text: str, model: Optional[str] = None) -> int:
         """

@@ -1302,6 +1302,223 @@ class TestUsageCheckpointsClient(unittest.TestCase):
         self.assertGreaterEqual(summary2["total_tokens"], 4)
 
 
+class TestCheckpointSaveLoadExport(unittest.TestCase):
+    """Tests for checkpoint save/load/export functionality."""
+    
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.temp_file = os.path.join(self.temp_dir, "checkpoint_save_test.json")
+        self.tracker = LLMUsageTracker(self.temp_file)
+    
+    def tearDown(self):
+        if os.path.exists(self.temp_file):
+            os.remove(self.temp_file)
+        os.rmdir(self.temp_dir)
+    
+    def test_save_checkpoint_data(self):
+        """Test saving usage data with checkpoint information."""
+        # Create some usage data with checkpoints
+        self.tracker.track_usage("gpt-4", "openai", 10, 5, 15, 0.001, response_time=1.0)
+        
+        self.tracker.start_usage_checkpoint("test_checkpoint")
+        self.tracker.track_usage("gpt-3.5-turbo", "openai", 8, 4, 12, 0.0008, response_time=0.8)
+        self.tracker.track_usage("claude-3", "anthropic", 6, 3, 9, 0.0006, response_time=0.9)
+        self.tracker.end_usage_checkpoint("test_checkpoint")
+        
+        self.tracker.track_usage("gpt-4", "openai", 5, 2, 7, 0.0005, response_time=0.7)
+        
+        # Save data
+        self.tracker.save_usage_data()
+        
+        # Verify file was created and contains checkpoint info
+        self.assertTrue(os.path.exists(self.temp_file))
+        
+        with open(self.temp_file, 'r') as f:
+            data = json.load(f)
+        
+        # Check structure
+        self.assertIn("usage_data", data)
+        self.assertIn("checkpoint_ranges", data)
+        self.assertIn("checkpoint_stacks", data)
+        self.assertIn("metadata", data)
+        
+        # Check usage data
+        self.assertEqual(len(data["usage_data"]), 4)
+        
+        # Check checkpoint ranges
+        self.assertIn("test_checkpoint", data["checkpoint_ranges"])
+        self.assertEqual(len(data["checkpoint_ranges"]["test_checkpoint"]), 1)
+        self.assertEqual(data["checkpoint_ranges"]["test_checkpoint"][0], [1, 3])  # indices 1-2
+        
+        # Check metadata
+        self.assertIn("saved_at", data["metadata"])
+        self.assertEqual(data["metadata"]["total_usage_records"], 4)
+        self.assertEqual(data["metadata"]["total_checkpoints"], 1)
+    
+    def test_load_checkpoint_data(self):
+        """Test loading usage data with checkpoint information."""
+        # Create and save data with checkpoints
+        self.tracker.track_usage("gpt-4", "openai", 10, 5, 15, 0.001, response_time=1.0)
+        
+        self.tracker.start_usage_checkpoint("test_checkpoint")
+        self.tracker.track_usage("gpt-3.5-turbo", "openai", 8, 4, 12, 0.0008, response_time=0.8)
+        self.tracker.end_usage_checkpoint("test_checkpoint")
+        
+        self.tracker.save_usage_data()
+        
+        # Create new tracker and load data
+        new_tracker = LLMUsageTracker(os.path.join(self.temp_dir, "new_checkpoint_test.json"))
+        new_tracker.load_usage_data(self.temp_file)
+        
+        # Verify data was loaded
+        self.assertEqual(len(new_tracker.usage_data), 2)
+        self.assertEqual(new_tracker.usage_data[0].model, "gpt-4")
+        self.assertEqual(new_tracker.usage_data[1].model, "gpt-3.5-turbo")
+        
+        # Verify checkpoint information was restored
+        self.assertIn("test_checkpoint", new_tracker._checkpoint_ranges)
+        self.assertEqual(len(new_tracker._checkpoint_ranges["test_checkpoint"]), 1)
+        self.assertEqual(new_tracker._checkpoint_ranges["test_checkpoint"][0], (1, 2))
+        
+        # Verify checkpoint usage works
+        checkpoint_usage = new_tracker.get_checkpoint_usage("test_checkpoint")
+        self.assertEqual(checkpoint_usage.total_requests, 1)
+        self.assertEqual(checkpoint_usage.total_tokens, 12)
+    
+    def test_load_legacy_format(self):
+        """Test loading legacy format (list) data."""
+        # Create legacy format data
+        legacy_data = [
+            {
+                "timestamp": "2024-01-01T00:00:00Z",
+                "model": "gpt-4",
+                "provider": "openai",
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "cost": 0.001,
+                "request_id": None,
+                "response_time": 1.0,
+                "success": True,
+                "error_message": None
+            }
+        ]
+        
+        with open(self.temp_file, 'w') as f:
+            json.dump(legacy_data, f)
+        
+        # Load with new tracker
+        new_tracker = LLMUsageTracker(os.path.join(self.temp_dir, "legacy_test.json"))
+        new_tracker.load_usage_data(self.temp_file)
+        
+        # Verify data was loaded
+        self.assertEqual(len(new_tracker.usage_data), 1)
+        self.assertEqual(new_tracker.usage_data[0].model, "gpt-4")
+        
+        # Verify checkpoint data is empty (legacy format)
+        self.assertEqual(len(new_tracker._checkpoint_ranges), 0)
+        self.assertEqual(len(new_tracker._checkpoint_stacks), 0)
+    
+    def test_export_checkpoint_data(self):
+        """Test exporting data for a specific checkpoint."""
+        # Create usage data with checkpoints
+        self.tracker.track_usage("gpt-4", "openai", 10, 5, 15, 0.001, response_time=1.0)
+        
+        self.tracker.start_usage_checkpoint("test_checkpoint")
+        self.tracker.track_usage("gpt-3.5-turbo", "openai", 8, 4, 12, 0.0008, response_time=0.8)
+        self.tracker.track_usage("claude-3", "anthropic", 6, 3, 9, 0.0006, response_time=0.9)
+        self.tracker.end_usage_checkpoint("test_checkpoint")
+        
+        self.tracker.track_usage("gpt-4", "openai", 5, 2, 7, 0.0005, response_time=0.7)
+        
+        # Export all data
+        all_export_file = os.path.join(self.temp_dir, "all_data.json")
+        self.tracker.export_usage_data(all_export_file, format='json')
+        
+        with open(all_export_file, 'r') as f:
+            all_data = json.load(f)
+        self.assertEqual(len(all_data), 4)
+        
+        # Export checkpoint data only
+        checkpoint_export_file = os.path.join(self.temp_dir, "checkpoint_data.json")
+        self.tracker.export_usage_data(checkpoint_export_file, format='json', checkpoint_name="test_checkpoint")
+        
+        with open(checkpoint_export_file, 'r') as f:
+            checkpoint_data = json.load(f)
+        self.assertEqual(len(checkpoint_data), 2)
+        self.assertEqual(checkpoint_data[0]["model"], "gpt-3.5-turbo")
+        self.assertEqual(checkpoint_data[1]["model"], "claude-3")
+        
+        # Clean up
+        os.remove(all_export_file)
+        os.remove(checkpoint_export_file)
+    
+    def test_export_checkpoint_csv(self):
+        """Test exporting checkpoint data as CSV."""
+        # Create usage data with checkpoints
+        self.tracker.start_usage_checkpoint("test_checkpoint")
+        self.tracker.track_usage("gpt-3.5-turbo", "openai", 8, 4, 12, 0.0008, response_time=0.8)
+        self.tracker.track_usage("claude-3", "anthropic", 6, 3, 9, 0.0006, response_time=0.9)
+        self.tracker.end_usage_checkpoint("test_checkpoint")
+        
+        # Export as CSV
+        csv_file = os.path.join(self.temp_dir, "checkpoint_data.csv")
+        self.tracker.export_usage_data(csv_file, format='csv', checkpoint_name="test_checkpoint")
+        
+        # Verify CSV file
+        self.assertTrue(os.path.exists(csv_file))
+        
+        with open(csv_file, 'r') as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["model"], "gpt-3.5-turbo")
+        self.assertEqual(rows[1]["model"], "claude-3")
+        
+        # Clean up
+        os.remove(csv_file)
+    
+    def test_export_nonexistent_checkpoint(self):
+        """Test exporting data for a nonexistent checkpoint."""
+        # Create some usage data
+        self.tracker.track_usage("gpt-4", "openai", 10, 5, 15, 0.001, response_time=1.0)
+        
+        # Export nonexistent checkpoint
+        export_file = os.path.join(self.temp_dir, "nonexistent_checkpoint.json")
+        self.tracker.export_usage_data(export_file, format='json', checkpoint_name="nonexistent")
+        
+        # Should create empty file
+        with open(export_file, 'r') as f:
+            data = json.load(f)
+        self.assertEqual(len(data), 0)
+        
+        # Clean up
+        os.remove(export_file)
+    
+    def test_client_export_checkpoint(self):
+        """Test exporting checkpoint data through client."""
+        client = LLMClient(self.tracker)
+        
+        # Create usage data with checkpoints
+        client.start_usage_checkpoint("test_checkpoint")
+        client.usage_tracker.track_usage("gpt-3.5-turbo", "openai", 8, 4, 12, 0.0008, response_time=0.8)
+        client.end_usage_checkpoint("test_checkpoint")
+        
+        # Export through client
+        export_file = os.path.join(self.temp_dir, "client_checkpoint_export.json")
+        client.export_usage_data(export_file, format='json', checkpoint_name="test_checkpoint")
+        
+        # Verify export
+        with open(export_file, 'r') as f:
+            data = json.load(f)
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["model"], "gpt-3.5-turbo")
+        
+        # Clean up
+        os.remove(export_file)
+
+
 if __name__ == '__main__':
     # Run the tests
     unittest.main(verbosity=2)
