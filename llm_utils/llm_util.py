@@ -974,8 +974,8 @@ class LLMClient:
             )
         
         def calculate_tokens(model, response, merged_kwargs):
-            prompt_tokens = token_counter(model=model, prompt=prompt)
-            completion_tokens = token_counter(model=model, prompt=response['choices'][0]['text'])
+            prompt_tokens = token_counter(model=model, messages=[{"role": "user", "content": prompt}])
+            completion_tokens = token_counter(model=model, messages=[{"role": "assistant", "content": response['choices'][0]['text']}])
             total_tokens = prompt_tokens + completion_tokens
             return prompt_tokens, completion_tokens, total_tokens
         
