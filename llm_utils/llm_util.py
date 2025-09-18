@@ -27,7 +27,7 @@ from collections import defaultdict
 
 from litellm import completion, text_completion, get_llm_provider, token_counter, cost_per_token
 from litellm import completion_cost as litellm_get_total_cost
-from litellm.exceptions import RateLimitError, APIConnectionError, APIError
+from litellm.exceptions import RateLimitError, APIConnectionError, APIError, InternalServerError
 
 
 # Configure logging
@@ -804,7 +804,7 @@ class LLMClient:
                 
                 return response
                 
-            except (RateLimitError, APIConnectionError, APIError) as e:
+            except (RateLimitError, APIConnectionError, APIError, InternalServerError) as e:
                 last_exception = e
                 self.logger.warning(f"API error on attempt {attempt + 1}: {type(e).__name__}: {e}")
                 
