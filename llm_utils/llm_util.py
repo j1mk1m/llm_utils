@@ -509,17 +509,35 @@ class LLMUsageTracker:
         """
         save_path = file_path or self.data_file
         
+        # First, take a snapshot of the data we need while holding the lock
         with self.lock:
-            data_to_save = {
-                "usage_data": [asdict(usage) for usage in self.usage_data],
-                "checkpoint_ranges": dict(self._checkpoint_ranges),
-                "checkpoint_stacks": dict(self._checkpoint_stacks),
-                "metadata": {
-                    "saved_at": datetime.now(timezone.utc).isoformat(),
-                    "total_usage_records": len(self.usage_data),
-                    "total_checkpoints": len(self._checkpoint_ranges)
-                }
+            usage_snapshot = list(self.usage_data)
+            checkpoint_ranges_snapshot = dict(self._checkpoint_ranges)
+            checkpoint_stacks_snapshot = dict(self._checkpoint_stacks)
+            total_usage_records = len(self.usage_data)
+            total_checkpoints = len(self._checkpoint_ranges)
+
+        # Compute aggregates outside the lock to avoid deadlocks (aggregation acquires the lock internally)
+        overall_aggregate = asdict(self.get_aggregated_usage())
+
+        # Compute per-checkpoint aggregates
+        checkpoint_aggregates: Dict[str, Dict[str, Any]] = {}
+        for checkpoint_name in checkpoint_ranges_snapshot.keys():
+            checkpoint_aggregates[checkpoint_name] = asdict(self.get_checkpoint_usage(checkpoint_name))
+
+        # Build the final payload
+        data_to_save = {
+            "usage_data": [asdict(usage) for usage in usage_snapshot],
+            "checkpoint_ranges": checkpoint_ranges_snapshot,
+            "checkpoint_stacks": checkpoint_stacks_snapshot,
+            "usage_aggregate": overall_aggregate,
+            "checkpoint_aggregates": checkpoint_aggregates,
+            "metadata": {
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "total_usage_records": total_usage_records,
+                "total_checkpoints": total_checkpoints
             }
+        }
         
         # Ensure directory exists
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -550,13 +568,7 @@ class LLMUsageTracker:
                 data = json.load(f)
             
             with self.lock:
-                # Handle both old format (list) and new format (dict with checkpoint info)
-                if isinstance(data, list):
-                    # Old format - just usage data
-                    self.usage_data = [UsageData(**item) for item in data]
-                    self.logger.info(f"Loaded {len(self.usage_data)} usage records from {load_path} (legacy format)")
-                elif isinstance(data, dict) and "usage_data" in data:
-                    # New format - includes checkpoint information
+                if isinstance(data, dict) and "usage_data" in data:
                     self.usage_data = [UsageData(**item) for item in data["usage_data"]]
                     
                     # Restore checkpoint information

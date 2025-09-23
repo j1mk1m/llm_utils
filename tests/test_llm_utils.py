@@ -1527,40 +1527,6 @@ class TestCheckpointSaveLoadExport(unittest.TestCase):
         self.assertEqual(checkpoint_usage.total_requests, 1)
         self.assertEqual(checkpoint_usage.total_tokens, 12)
     
-    def test_load_legacy_format(self):
-        """Test loading legacy format (list) data."""
-        # Create legacy format data
-        legacy_data = [
-            {
-                "timestamp": "2024-01-01T00:00:00Z",
-                "model": "gpt-4",
-                "provider": "openai",
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15,
-                "cost": 0.001,
-                "request_id": None,
-                "response_time": 1.0,
-                "success": True,
-                "error_message": None
-            }
-        ]
-        
-        with open(self.temp_file, 'w') as f:
-            json.dump(legacy_data, f)
-        
-        # Load with new tracker
-        new_tracker = LLMUsageTracker(os.path.join(self.temp_dir, "legacy_test.json"))
-        new_tracker.load_usage_data(self.temp_file)
-        
-        # Verify data was loaded
-        self.assertEqual(len(new_tracker.usage_data), 1)
-        self.assertEqual(new_tracker.usage_data[0].model, "gpt-4")
-        
-        # Verify checkpoint data is empty (legacy format)
-        self.assertEqual(len(new_tracker._checkpoint_ranges), 0)
-        self.assertEqual(len(new_tracker._checkpoint_stacks), 0)
-    
     def test_export_checkpoint_data(self):
         """Test exporting data for a specific checkpoint."""
         # Create usage data with checkpoints
