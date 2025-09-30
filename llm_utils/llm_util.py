@@ -508,6 +508,7 @@ class LLMUsageTracker:
             file_path: Optional custom file path. If None, uses the default data_file.
         """
         save_path = file_path or self.data_file
+        save_path = os.path.abspath(save_path)
         
         # First, take a snapshot of the data we need while holding the lock
         with self.lock:
@@ -527,11 +528,11 @@ class LLMUsageTracker:
 
         # Build the final payload
         data_to_save = {
-            "usage_data": [asdict(usage) for usage in usage_snapshot],
+            "usage_aggregate": overall_aggregate,
             "checkpoint_ranges": checkpoint_ranges_snapshot,
             "checkpoint_stacks": checkpoint_stacks_snapshot,
-            "usage_aggregate": overall_aggregate,
             "checkpoint_aggregates": checkpoint_aggregates,
+            "usage_data": [asdict(usage) for usage in usage_snapshot],
             "metadata": {
                 "saved_at": datetime.now(timezone.utc).isoformat(),
                 "total_usage_records": total_usage_records,
@@ -618,6 +619,7 @@ class LLMUsageTracker:
                 self.logger.info(f"Exporting {len(data_to_export)} usage records")
         
         # Ensure directory exists
+        file_path = os.path.abspath(file_path)
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         
         if format == 'json':
@@ -733,6 +735,7 @@ class LLMClient:
         # Get provider information
         try:
             provider = get_llm_provider(model)
+            provider = provider[1] if isinstance(provider, tuple) else provider
         except Exception:
             provider = "unknown"
         
@@ -1123,11 +1126,13 @@ class LLMClient:
             raise ValueError("No model provided and no default_model set")
         
         cost_info = self.usage_tracker.get_model_cost_info(model)
+        provider = get_llm_provider(model) if model else "unknown"
+        provider = provider[1] if isinstance(provider, tuple) else provider
         
         return {
             "model": model,
             "cost_info": cost_info,
-            "provider": get_llm_provider(model) if model else "unknown"
+            "provider": provider
         }
     
     def register_custom_model(self, model_name: str, cost_dict: Dict[str, Any]) -> bool:
@@ -1178,6 +1183,8 @@ def create_llm_client(data_file: Optional[str] = None,
                      default_temperature: Optional[float] = None,
                      default_max_tokens: Optional[int] = None,
                      default_api_base: Optional[str] = None,
+                     default_retry_attempts: int = 3,
+                     default_retry_delay: float = 1.0,
                      logger: Optional[logging.Logger] = None) -> LLMClient:
     """
     Create a new LLM client with usage tracking.
@@ -1200,6 +1207,8 @@ def create_llm_client(data_file: Optional[str] = None,
         default_temperature=default_temperature,
         default_max_tokens=default_max_tokens,
         default_api_base=default_api_base,
+        default_retry_attempts=default_retry_attempts,
+        default_retry_delay=default_retry_delay,
         logger=logger
     )
 
@@ -1227,80 +1236,4 @@ def get_usage_summary(client: LLMClient, **kwargs) -> Dict[str, Any]:
         "top_providers": sorted(stats.provider_breakdown.items(), 
                               key=lambda x: x[1]['requests'], reverse=True)[:5]
     }
-
-
-# Example usage and configuration
-if __name__ == "__main__":
-    # Set up logging
-    setup_logging(level="INFO", log_file="llm_utils.log")
-    
-    # Example usage with default parameters
-    client = LLMClient(
-        default_model="gpt-3.5-turbo",
-        default_temperature=0.7,
-        default_max_tokens=1000,
-        default_api_base=None  # Use default OpenAI API base
-    )
-    
-    # Example: Token counting and cost estimation
-    sample_text = "Hello, how are you today?"
-    messages = [{"role": "user", "content": sample_text}]
-    
-    print("=== Token Counting and Cost Estimation ===")
-    token_count = client.count_tokens(sample_text)
-    message_token_count = client.count_message_tokens(messages)
-    print(f"Text tokens: {token_count}")
-    print(f"Message tokens: {message_token_count}")
-    
-    # Cost estimation
-    cost_estimate = client.estimate_cost(messages, estimated_completion_tokens=50)
-    print(f"Cost estimate: ${cost_estimate['total_cost']:.6f}")
-    print(f"  - Prompt cost: ${cost_estimate['prompt_cost']:.6f}")
-    print(f"  - Completion cost: ${cost_estimate['completion_cost']:.6f}")
-    
-    # Model information
-    model_info = client.get_model_info()
-    print(f"Model info: {model_info}")
-    
-    # Example: Encoding and decoding
-    print("\n=== Encoding and Decoding ===")
-    tokens = client.usage_tracker.encode_text(sample_text, "gpt-3.5-turbo")
-    decoded_text = client.usage_tracker.decode_tokens(tokens, "gpt-3.5-turbo")
-    print(f"Original: {sample_text}")
-    print(f"Decoded: {decoded_text}")
-    print(f"Tokens: {tokens[:10]}...")  # Show first 10 tokens
-    
-    # Example chat completion using default model and parameters
-    print("\n=== Chat Completion ===")
-    try:
-        response = client.chat_completion(
-            messages=[
-                {"role": "user", "content": "Hello, how are you?"}
-            ]
-        )
-        print("Response:", response['choices'][0]['message']['content'])
-    except Exception as e:
-        print(f"Error: {e}")
-    
-    # Example text completion with overridden temperature
-    print("\n=== Text Completion ===")
-    try:
-        response = client.text_completion(
-            prompt="Write a short poem about coding",
-            temperature=0.9  # Override default temperature
-        )
-        print("Poem:", response['choices'][0]['text'])
-    except Exception as e:
-        print(f"Error: {e}")
-    
-    # Get usage statistics
-    print("\n=== Usage Statistics ===")
-    stats = client.get_usage_stats()
-    print(f"Total requests: {stats.total_requests}")
-    print(f"Total cost: ${stats.total_cost:.4f}")
-    print(f"Success rate: {stats.success_rate:.1%}")
-    
-    # Save usage data
-    client.save_usage_data()
-    print("Usage data saved!")
 
