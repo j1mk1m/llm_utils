@@ -9,7 +9,7 @@ including different log levels, file outputs, and custom formatting.
 import logging
 import os
 from datetime import datetime
-from llm_utils.llm_util import setup_logging, create_llm_client, get_logger
+from llm_utils import setup_logging, create_llm_client, get_logger
 
 
 def example_basic_logging():
