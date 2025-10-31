@@ -7,6 +7,7 @@ usage tracking and data persistence capabilities.
 
 Features:
 - Multi-backend support (OpenAI, Anthropic, AWS Bedrock, vLLM, etc.)
+- Chat completions, text completions, and embeddings support
 - Automatic usage tracking and aggregation
 - Data persistence (save/load usage data)
 - Cost calculation and analytics
@@ -25,7 +26,7 @@ from typing import Any, Dict, List, Optional, Union, Literal
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 
-from litellm import completion, text_completion, get_llm_provider, token_counter, cost_per_token
+from litellm import completion, text_completion, embedding, get_llm_provider, token_counter, cost_per_token
 from litellm import completion_cost as litellm_get_total_cost
 from litellm.exceptions import RateLimitError, APIConnectionError, APIError, InternalServerError
 
@@ -890,7 +891,12 @@ class LLMClient:
             response: The response from LiteLLM
             request_type: Type of request for logging
         """
-        if 'choices' in response and response['choices']:
+        if request_type == "embedding":
+            if 'data' in response and response['data']:
+                num_embeddings = len(response['data'])
+                embedding_dim = len(response['data'][0].get('embedding', [])) if response['data'] else 0
+                self.logger.debug(f"Response: {num_embeddings} embedding(s) of dimension {embedding_dim}")
+        elif 'choices' in response and response['choices']:
             if request_type == "text completion":
                 response_content = response['choices'][0].get('text', '')
             else:
@@ -1001,6 +1007,76 @@ class LLMClient:
         try:
             return self._execute_request_with_retry(
                 model, provider, merged_kwargs, request_func, "text completion"
+            )
+        finally:
+            # Restore original method
+            self._calculate_tokens_for_response = original_calculate
+    
+    def embedding(self,
+                  input: Union[str, List[str]],
+                  model: Optional[str] = None,
+                  **kwargs) -> Dict[str, Any]:
+        """
+        Make an embedding request.
+        
+        Args:
+            input: The text or list of texts to embed
+            model: The model to use. If None, uses default_model.
+            **kwargs: Additional arguments for the embedding call
+            
+        Returns:
+            Response dictionary from LiteLLM with embeddings
+        """
+        model, provider, merged_kwargs = self._prepare_request(model, **kwargs)
+        
+        # Normalize input to list for consistent handling
+        inputs_list = input if isinstance(input, list) else [input]
+        
+        # Log input in debug mode
+        self.logger.debug(f"Request embeddings for {len(inputs_list)} input(s)")
+        
+        def request_func():
+            return embedding(
+                model=model,
+                input=input,
+                **merged_kwargs
+            )
+        
+        def calculate_tokens(model, response, merged_kwargs):
+            # For embeddings, tokens are typically just the input tokens
+            # The response may have usage information, or we calculate from input
+            if 'usage' in response:
+                usage = response['usage']
+                # Try different possible usage field names
+                total_tokens = usage.get('total_tokens') or usage.get('prompt_tokens') or usage.get('input_tokens') or 0
+                if total_tokens > 0:
+                    # For embeddings, all tokens are typically considered "prompt" tokens
+                    # as there's no separate completion
+                    prompt_tokens = total_tokens
+                    completion_tokens = 0
+                else:
+                    # Fallback: count tokens from input texts
+                    prompt_tokens = 0
+                    for text in inputs_list:
+                        prompt_tokens += token_counter(model=model, messages=[{"role": "user", "content": text}])
+                    completion_tokens = 0
+                    total_tokens = prompt_tokens
+            else:
+                # Fallback: count tokens from input texts
+                prompt_tokens = 0
+                for text in inputs_list:
+                    prompt_tokens += token_counter(model=model, messages=[{"role": "user", "content": text}])
+                completion_tokens = 0
+                total_tokens = prompt_tokens
+            return prompt_tokens, completion_tokens, total_tokens
+        
+        # Temporarily override the token calculation method
+        original_calculate = self._calculate_tokens_for_response
+        self._calculate_tokens_for_response = calculate_tokens
+        
+        try:
+            return self._execute_request_with_retry(
+                model, provider, merged_kwargs, request_func, "embedding"
             )
         finally:
             # Restore original method

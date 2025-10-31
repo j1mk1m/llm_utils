@@ -479,6 +479,92 @@ class TestLLMClient(unittest.TestCase):
         self.assertEqual(usage.model, "gpt-3.5-turbo")
         self.assertTrue(usage.success)
     
+    @patch('llm_utils.llm_util.embedding')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_embedding_success(self, mock_get_provider, mock_token_counter, mock_embedding_cost, mock_embedding):
+        """Test successful embedding request."""
+        # Mock responses
+        mock_get_provider.return_value = "openai"
+        mock_embedding.return_value = {
+            'data': [{'embedding': [0.1, 0.2, 0.3]}],
+            'usage': {'total_tokens': 5, 'prompt_tokens': 5}
+        }
+        mock_embedding_cost.return_value = 0.0001  # Now returns float
+        mock_token_counter.side_effect = [5]  # Only prompt tokens for embeddings
+        
+        response = self.client.embedding(input="Hello world", model="text-embedding-ada-002")
+        
+        self.assertEqual(len(response['data']), 1)
+        self.assertEqual(len(response['data'][0]['embedding']), 3)
+        mock_embedding.assert_called_once()
+        
+        # Check that usage was tracked
+        self.assertEqual(len(self.tracker.usage_data), 1)
+        usage = self.tracker.usage_data[0]
+        self.assertEqual(usage.model, "text-embedding-ada-002")
+        self.assertEqual(usage.provider, "openai")
+        self.assertEqual(usage.prompt_tokens, 5)
+        self.assertEqual(usage.completion_tokens, 0)
+        self.assertTrue(usage.success)
+    
+    @patch('llm_utils.llm_util.embedding')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_embedding_list_input(self, mock_get_provider, mock_token_counter, mock_embedding_cost, mock_embedding):
+        """Test embedding with list of strings."""
+        # Mock responses
+        mock_get_provider.return_value = "openai"
+        mock_embedding.return_value = {
+            'data': [
+                {'embedding': [0.1, 0.2]},
+                {'embedding': [0.3, 0.4]}
+            ],
+            'usage': {'total_tokens': 10, 'prompt_tokens': 10}
+        }
+        mock_embedding_cost.return_value = 0.0002  # Now returns float
+        mock_token_counter.side_effect = [5, 5]  # Two inputs
+        
+        response = self.client.embedding(input=["Hello", "World"], model="text-embedding-ada-002")
+        
+        self.assertEqual(len(response['data']), 2)
+        mock_embedding.assert_called_once()
+        
+        # Check that usage was tracked
+        self.assertEqual(len(self.tracker.usage_data), 1)
+        usage = self.tracker.usage_data[0]
+        self.assertEqual(usage.model, "text-embedding-ada-002")
+        self.assertEqual(usage.prompt_tokens, 10)
+        self.assertEqual(usage.completion_tokens, 0)
+    
+    @patch('llm_utils.llm_util.embedding')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_embedding_no_usage_in_response(self, mock_get_provider, mock_token_counter, mock_embedding_cost, mock_embedding):
+        """Test embedding when response doesn't have usage info - should fall back to token counting."""
+        # Mock responses
+        mock_get_provider.return_value = "openai"
+        mock_embedding.return_value = {
+            'data': [{'embedding': [0.1, 0.2, 0.3]}]
+            # No usage field
+        }
+        mock_embedding_cost.return_value = 0.0001  # Now returns float
+        mock_token_counter.side_effect = [5]  # Fallback token counting
+        
+        response = self.client.embedding(input="Hello world", model="text-embedding-ada-002")
+        
+        self.assertEqual(len(response['data']), 1)
+        mock_embedding.assert_called_once()
+        
+        # Check that usage was tracked (using fallback token counting)
+        self.assertEqual(len(self.tracker.usage_data), 1)
+        usage = self.tracker.usage_data[0]
+        self.assertEqual(usage.model, "text-embedding-ada-002")
+        self.assertEqual(usage.completion_tokens, 0)  # Embeddings always have 0 completion tokens
+    
     @patch('llm_utils.llm_util.completion')
     @patch('llm_utils.llm_util.litellm_get_total_cost')
     @patch('llm_utils.llm_util.token_counter')
@@ -536,6 +622,32 @@ class TestLLMClient(unittest.TestCase):
         usage = self.tracker.usage_data[0]
         self.assertFalse(usage.success)
         self.assertIn("API error", usage.error_message)
+    
+    @patch('llm_utils.llm_util.embedding')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_embedding_track_failed_usage(self, mock_get_provider, mock_embedding_cost, mock_embedding):
+        """Test tracking failed embedding usage."""
+        # Import here to avoid import issues in test environment
+        try:
+            from litellm.exceptions import APIError  # type: ignore
+        except ImportError:
+            # Create a mock exception if litellm is not available
+            class APIError(Exception):
+                pass
+        
+        mock_get_provider.return_value = "openai"
+        mock_embedding.side_effect = APIError(500, "API error", "openai", "text-embedding-ada-002")
+        
+        with self.assertRaises(APIError):
+            self.client.embedding(input="Hello", model="text-embedding-ada-002")
+        
+        # Check that failed usage was tracked
+        self.assertEqual(len(self.tracker.usage_data), 1)
+        usage = self.tracker.usage_data[0]
+        self.assertFalse(usage.success)
+        self.assertIn("API error", usage.error_message)
+        self.assertEqual(usage.model, "text-embedding-ada-002")
     
     def test_get_usage_stats(self):
         """Test getting usage statistics."""
@@ -649,6 +761,35 @@ class TestDefaultParameters(unittest.TestCase):
         self.assertEqual(call_args[1]['temperature'], 0.7)
         self.assertEqual(call_args[1]['max_tokens'], 1000)
         self.assertEqual(call_args[1]['api_base'], "https://api.openai.com/v1")
+    
+    @patch('llm_utils.llm_util.embedding')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_embedding_with_defaults(self, mock_get_provider, mock_token_counter, mock_embedding_cost, mock_embedding):
+        """Test embedding using all default parameters."""
+        mock_get_provider.return_value = "openai"
+        mock_embedding.return_value = {
+            'data': [{'embedding': [0.1, 0.2, 0.3]}],
+            'usage': {'total_tokens': 5, 'prompt_tokens': 5}
+        }
+        mock_embedding_cost.return_value = 0.0001  # Now returns float
+        mock_token_counter.side_effect = [5]  # prompt_tokens
+        
+        # Create client with default embedding model
+        client_with_embedding_model = LLMClient(
+            self.tracker,
+            default_model="text-embedding-ada-002"
+        )
+        
+        response = client_with_embedding_model.embedding(input="Hello")
+        
+        self.assertEqual(len(response['data']), 1)
+        
+        # Check that embedding was called with default parameters
+        mock_embedding.assert_called_once()
+        call_args = mock_embedding.call_args
+        self.assertEqual(call_args[1]['model'], "text-embedding-ada-002")
     
     @patch('llm_utils.llm_util.completion')
     @patch('llm_utils.llm_util.litellm_get_total_cost')
@@ -841,6 +982,25 @@ class TestRefactoredSharedMethods(unittest.TestCase):
         # This should not raise an exception
         self.client._log_response_content(response, "test")
     
+    def test_log_response_content_embedding(self):
+        """Test _log_response_content method for embedding."""
+        response = {
+            'data': [
+                {'embedding': [0.1, 0.2, 0.3]},
+                {'embedding': [0.4, 0.5, 0.6]}
+            ]
+        }
+        
+        # This should not raise an exception
+        self.client._log_response_content(response, "embedding")
+    
+    def test_log_response_content_embedding_empty_data(self):
+        """Test _log_response_content method with empty embedding data."""
+        response = {'data': []}
+        
+        # This should not raise an exception
+        self.client._log_response_content(response, "embedding")
+    
     @patch('llm_utils.llm_util.completion')
     @patch('llm_utils.llm_util.litellm_get_total_cost')
     @patch('llm_utils.llm_util.token_counter')
@@ -908,6 +1068,42 @@ class TestRefactoredSharedMethods(unittest.TestCase):
             )
             
             self.assertEqual(response['choices'][0]['text'], 'Hello world!')
+            self.assertEqual(len(self.tracker.usage_data), 1)
+        finally:
+            # Restore original method
+            self.client._calculate_tokens_for_response = original_calculate
+    
+    @patch('llm_utils.llm_util.embedding')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_shared_execute_request_with_retry_embedding(self, mock_get_provider, mock_token_counter, mock_embedding_cost, mock_embedding):
+        """Test _execute_request_with_retry method with embedding."""
+        mock_get_provider.return_value = "openai"
+        mock_embedding.return_value = {
+            'data': [{'embedding': [0.1, 0.2, 0.3]}],
+            'usage': {'total_tokens': 5, 'prompt_tokens': 5}
+        }
+        mock_embedding_cost.return_value = 0.0001
+        mock_token_counter.side_effect = [5]
+        
+        def request_func():
+            from llm_utils.llm_util import embedding
+            return embedding(model="text-embedding-ada-002", input="Hello")
+        
+        def calculate_tokens(model, response, merged_kwargs):
+            return 5, 0, 5  # prompt_tokens, completion_tokens, total_tokens
+        
+        # Temporarily override the token calculation method
+        original_calculate = self.client._calculate_tokens_for_response
+        self.client._calculate_tokens_for_response = calculate_tokens
+        
+        try:
+            response = self.client._execute_request_with_retry(
+                "text-embedding-ada-002", "openai", {}, request_func, "embedding"
+            )
+            
+            self.assertEqual(len(response['data']), 1)
             self.assertEqual(len(self.tracker.usage_data), 1)
         finally:
             # Restore original method
@@ -1248,6 +1444,71 @@ class TestLogging(unittest.TestCase):
             
             self.assertIn("Unexpected error in LLM chat completion", log_content)
             self.assertIn("API Error", log_content)
+    
+    def test_client_embedding_logging(self):
+        """Test logging in LLM client for embeddings."""
+        # Set up logging
+        setup_logging(level="INFO", log_file=self.temp_file)
+        
+        # Create client
+        client = LLMClient(default_model="text-embedding-ada-002")
+        
+        # Mock the embedding call
+        with patch('llm_utils.llm_util.embedding') as mock_embedding, \
+             patch('llm_utils.llm_util.litellm_get_total_cost') as mock_embedding_cost, \
+             patch('llm_utils.llm_util.token_counter') as mock_token_counter, \
+             patch('llm_utils.llm_util.get_llm_provider') as mock_get_provider:
+            
+            mock_get_provider.return_value = "openai"
+            mock_embedding.return_value = {
+                'data': [{'embedding': [0.1, 0.2, 0.3]}],
+                'usage': {'total_tokens': 5, 'prompt_tokens': 5}
+            }
+            mock_embedding_cost.return_value = 0.0001  # Now returns float
+            mock_token_counter.side_effect = [5]  # prompt_tokens
+            
+            # Make request
+            response = client.embedding(input="Hello world")
+            
+            # Check that logs were written
+            with open(self.temp_file, 'r') as f:
+                log_content = f.read()
+            
+            self.assertIn("Making LLM embedding to text-embedding-ada-002", log_content)
+            self.assertIn("LLM embedding successful", log_content)
+            self.assertIn("openai", log_content)
+    
+    def test_client_embedding_debug_logging(self):
+        """Test debug logging in LLM client for embeddings."""
+        # Set up debug logging
+        setup_logging(level="DEBUG", log_file=self.temp_file)
+        
+        # Create client
+        client = LLMClient(default_model="text-embedding-ada-002")
+        
+        # Mock the embedding call
+        with patch('llm_utils.llm_util.embedding') as mock_embedding, \
+             patch('llm_utils.llm_util.litellm_get_total_cost') as mock_embedding_cost, \
+             patch('llm_utils.llm_util.token_counter') as mock_token_counter, \
+             patch('llm_utils.llm_util.get_llm_provider') as mock_get_provider:
+            
+            mock_get_provider.return_value = "openai"
+            mock_embedding.return_value = {
+                'data': [{'embedding': [0.1, 0.2, 0.3]}],
+                'usage': {'total_tokens': 5, 'prompt_tokens': 5}
+            }
+            mock_embedding_cost.return_value = 0.0001  # Now returns float
+            mock_token_counter.side_effect = [5]  # prompt_tokens
+            
+            # Make request
+            response = client.embedding(input=["Hello", "World"])
+            
+            # Check that debug logs were written
+            with open(self.temp_file, 'r') as f:
+                log_content = f.read()
+            
+            self.assertIn("Request embeddings for 2 input(s)", log_content)
+            self.assertIn("Response: 1 embedding(s) of dimension 3", log_content)
     
     def test_retry_logging(self):
         """Test retry logging in LLM client."""
