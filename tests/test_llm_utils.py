@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock, call
@@ -103,6 +104,7 @@ class TestUsageAggregate(unittest.TestCase):
             success_rate=0.9,
             model_breakdown={"gpt-4": {"requests": 5, "tokens": 500}},
             provider_breakdown={"openai": {"requests": 10, "tokens": 1000}},
+            tag_breakdown={"": {"requests": 10, "tokens": 1000}},
             time_range={"start": "2024-01-01", "end": "2024-01-02"}
         )
         
@@ -1886,6 +1888,442 @@ class TestCheckpointSaveLoadExport(unittest.TestCase):
         
         # Clean up
         os.remove(export_file)
+
+
+class TestTagFeature(unittest.TestCase):
+    """Test cases for the tag feature in usage tracking."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.temp_file = os.path.join(self.temp_dir, "tag_test.json")
+        self.tracker = LLMUsageTracker(self.temp_file)
+        self.client = LLMClient(self.tracker)
+    
+    def tearDown(self):
+        """Clean up test fixtures."""
+        if os.path.exists(self.temp_file):
+            os.remove(self.temp_file)
+        os.rmdir(self.temp_dir)
+    
+    def test_usage_data_with_tag(self):
+        """Test UsageData creation with tag."""
+        usage = UsageData(
+            timestamp="2024-01-01T00:00:00Z",
+            model="gpt-4",
+            provider="openai",
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+            cost=0.03,
+            tag="test-tag"
+        )
+        
+        self.assertEqual(usage.tag, "test-tag")
+    
+    def test_usage_data_without_tag(self):
+        """Test UsageData creation without tag (default empty string)."""
+        usage = UsageData(
+            timestamp="2024-01-01T00:00:00Z",
+            model="gpt-4",
+            provider="openai",
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+            cost=0.03
+        )
+        
+        self.assertEqual(usage.tag, "")
+    
+    def test_track_usage_with_tag(self):
+        """Test tracking usage with a tag."""
+        self.tracker.track_usage(
+            model="gpt-4",
+            provider="openai",
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+            cost=0.03,
+            tag="production"
+        )
+        
+        self.assertEqual(len(self.tracker.usage_data), 1)
+        usage = self.tracker.usage_data[0]
+        self.assertEqual(usage.tag, "production")
+    
+    def test_track_usage_without_tag(self):
+        """Test tracking usage without tag (default empty string)."""
+        self.tracker.track_usage(
+            model="gpt-4",
+            provider="openai",
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+            cost=0.03
+        )
+        
+        self.assertEqual(len(self.tracker.usage_data), 1)
+        usage = self.tracker.usage_data[0]
+        self.assertEqual(usage.tag, "")
+    
+    def test_tag_breakdown_in_aggregate(self):
+        """Test tag breakdown in aggregated usage."""
+        # Track usage with different tags
+        self.tracker.track_usage("gpt-4", "openai", 100, 50, 150, 0.03, tag="production")
+        self.tracker.track_usage("gpt-3.5-turbo", "openai", 80, 40, 120, 0.02, tag="production")
+        self.tracker.track_usage("gpt-4", "openai", 90, 45, 135, 0.025, tag="development")
+        self.tracker.track_usage("claude-3", "anthropic", 70, 30, 100, 0.015, tag="")
+        
+        aggregate = self.tracker.get_aggregated_usage()
+        
+        # Check tag breakdown
+        self.assertIn("production", aggregate.tag_breakdown)
+        self.assertIn("development", aggregate.tag_breakdown)
+        self.assertIn("", aggregate.tag_breakdown)
+        
+        # Check production tag stats
+        prod_stats = aggregate.tag_breakdown["production"]
+        self.assertEqual(prod_stats["requests"], 2)
+        self.assertEqual(prod_stats["tokens"], 270)  # 150 + 120
+        self.assertAlmostEqual(prod_stats["cost"], 0.05, places=6)  # 0.03 + 0.02
+        
+        # Check development tag stats
+        dev_stats = aggregate.tag_breakdown["development"]
+        self.assertEqual(dev_stats["requests"], 1)
+        self.assertEqual(dev_stats["tokens"], 135)
+        self.assertAlmostEqual(dev_stats["cost"], 0.025, places=6)
+        
+        # Check empty tag stats
+        empty_stats = aggregate.tag_breakdown[""]
+        self.assertEqual(empty_stats["requests"], 1)
+        self.assertEqual(empty_stats["tokens"], 100)
+        self.assertAlmostEqual(empty_stats["cost"], 0.015, places=6)
+    
+    def test_tag_breakdown_with_response_times(self):
+        """Test tag breakdown includes average response times."""
+        self.tracker.track_usage("gpt-4", "openai", 100, 50, 150, 0.03, tag="production", response_time=1.0)
+        self.tracker.track_usage("gpt-4", "openai", 80, 40, 120, 0.02, tag="production", response_time=0.8)
+        
+        aggregate = self.tracker.get_aggregated_usage()
+        
+        prod_stats = aggregate.tag_breakdown["production"]
+        self.assertAlmostEqual(prod_stats["avg_response_time"], 0.9, places=1)  # (1.0 + 0.8) / 2
+    
+    def test_tag_breakdown_empty_data(self):
+        """Test tag breakdown with no data."""
+        aggregate = self.tracker.get_aggregated_usage()
+        
+        self.assertEqual(aggregate.tag_breakdown, {})
+    
+    @patch('llm_utils.llm_util.completion')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_chat_completion_with_tag(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
+        """Test chat completion with tag."""
+        mock_get_provider.return_value = "openai"
+        mock_completion.return_value = {
+            'choices': [{'message': {'content': 'Hello!'}}],
+            'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
+        }
+        mock_completion_cost.return_value = 0.001
+        mock_token_counter.side_effect = [10, 5]
+        
+        messages = [{"role": "user", "content": "Hello"}]
+        response = self.client.chat_completion(messages, model="gpt-3.5-turbo", tag="test-tag")
+        
+        # Check that usage was tracked with tag
+        self.assertEqual(len(self.tracker.usage_data), 1)
+        usage = self.tracker.usage_data[0]
+        self.assertEqual(usage.tag, "test-tag")
+        self.assertEqual(usage.model, "gpt-3.5-turbo")
+    
+    @patch('llm_utils.llm_util.text_completion')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_text_completion_with_tag(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
+        """Test text completion with tag."""
+        mock_get_provider.return_value = "openai"
+        mock_completion.return_value = {
+            'choices': [{'text': 'Hello world!'}],
+            'usage': {'prompt_tokens': 5, 'completion_tokens': 3, 'total_tokens': 8}
+        }
+        mock_completion_cost.return_value = 0.0005
+        mock_token_counter.side_effect = [5, 3]
+        
+        response = self.client.text_completion("Hello", model="gpt-3.5-turbo", tag="production")
+        
+        # Check that usage was tracked with tag
+        self.assertEqual(len(self.tracker.usage_data), 1)
+        usage = self.tracker.usage_data[0]
+        self.assertEqual(usage.tag, "production")
+    
+    @patch('llm_utils.llm_util.embedding')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_embedding_with_tag(self, mock_get_provider, mock_token_counter, mock_embedding_cost, mock_embedding):
+        """Test embedding with tag."""
+        mock_get_provider.return_value = "openai"
+        mock_embedding.return_value = {
+            'data': [{'embedding': [0.1, 0.2, 0.3]}],
+            'usage': {'total_tokens': 5, 'prompt_tokens': 5}
+        }
+        mock_embedding_cost.return_value = 0.0001
+        mock_token_counter.side_effect = [5]
+        
+        response = self.client.embedding(input="Hello world", model="text-embedding-ada-002", tag="embedding-tag")
+        
+        # Check that usage was tracked with tag
+        self.assertEqual(len(self.tracker.usage_data), 1)
+        usage = self.tracker.usage_data[0]
+        self.assertEqual(usage.tag, "embedding-tag")
+    
+    @patch('llm_utils.llm_util.completion')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_chat_completion_without_tag(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
+        """Test chat completion without tag (default empty string)."""
+        mock_get_provider.return_value = "openai"
+        mock_completion.return_value = {
+            'choices': [{'message': {'content': 'Hello!'}}],
+            'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
+        }
+        mock_completion_cost.return_value = 0.001
+        mock_token_counter.side_effect = [10, 5]
+        
+        messages = [{"role": "user", "content": "Hello"}]
+        response = self.client.chat_completion(messages, model="gpt-3.5-turbo")
+        
+        # Check that usage was tracked with empty tag
+        self.assertEqual(len(self.tracker.usage_data), 1)
+        usage = self.tracker.usage_data[0]
+        self.assertEqual(usage.tag, "")
+    
+    @patch('llm_utils.llm_util.completion')
+    @patch('llm_utils.llm_util.litellm_get_total_cost')
+    @patch('llm_utils.llm_util.token_counter')
+    @patch('llm_utils.llm_util.get_llm_provider')
+    def test_chat_completion_with_empty_tag(self, mock_get_provider, mock_token_counter, mock_completion_cost, mock_completion):
+        """Test chat completion with explicitly empty tag."""
+        mock_get_provider.return_value = "openai"
+        mock_completion.return_value = {
+            'choices': [{'message': {'content': 'Hello!'}}],
+            'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15}
+        }
+        mock_completion_cost.return_value = 0.001
+        mock_token_counter.side_effect = [10, 5]
+        
+        messages = [{"role": "user", "content": "Hello"}]
+        response = self.client.chat_completion(messages, model="gpt-3.5-turbo", tag="")
+        
+        # Check that usage was tracked with empty tag
+        self.assertEqual(len(self.tracker.usage_data), 1)
+        usage = self.tracker.usage_data[0]
+        self.assertEqual(usage.tag, "")
+    
+    def test_save_and_load_usage_data_with_tags(self):
+        """Test saving and loading usage data with tags."""
+        # Add test data with tags
+        self.tracker.track_usage("gpt-4", "openai", 100, 50, 150, 0.03, tag="production")
+        self.tracker.track_usage("gpt-3.5-turbo", "openai", 80, 40, 120, 0.02, tag="development")
+        
+        # Save data
+        self.tracker.save_usage_data()
+        
+        # Create new tracker and load data
+        new_tracker = LLMUsageTracker(os.path.join(self.temp_dir, "new_tag_test.json"))
+        new_tracker.load_usage_data(self.temp_file)
+        
+        self.assertEqual(len(new_tracker.usage_data), 2)
+        self.assertEqual(new_tracker.usage_data[0].tag, "production")
+        self.assertEqual(new_tracker.usage_data[1].tag, "development")
+    
+    def test_export_usage_data_with_tags(self):
+        """Test exporting usage data with tags."""
+        self.tracker.track_usage("gpt-4", "openai", 100, 50, 150, 0.03, tag="production")
+        
+        export_file = os.path.join(self.temp_dir, "tag_export.json")
+        self.tracker.export_usage_data(export_file, format='json')
+        
+        self.assertTrue(os.path.exists(export_file))
+        with open(export_file, 'r') as f:
+            data = json.load(f)
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]['tag'], "production")
+        
+        # Clean up
+        os.remove(export_file)
+    
+    def test_export_usage_data_csv_with_tags(self):
+        """Test exporting usage data as CSV with tags."""
+        self.tracker.track_usage("gpt-4", "openai", 100, 50, 150, 0.03, tag="production")
+        
+        export_file = os.path.join(self.temp_dir, "tag_export.csv")
+        self.tracker.export_usage_data(export_file, format='csv')
+        
+        self.assertTrue(os.path.exists(export_file))
+        with open(export_file, 'r') as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['tag'], "production")
+        
+        # Clean up
+        os.remove(export_file)
+    
+    def test_tag_in_checkpoint_usage(self):
+        """Test tag breakdown in checkpoint usage."""
+        self.tracker.start_usage_checkpoint("test_checkpoint")
+        self.tracker.track_usage("gpt-4", "openai", 100, 50, 150, 0.03, tag="production")
+        self.tracker.track_usage("gpt-3.5-turbo", "openai", 80, 40, 120, 0.02, tag="production")
+        self.tracker.track_usage("claude-3", "anthropic", 90, 45, 135, 0.025, tag="development")
+        self.tracker.end_usage_checkpoint("test_checkpoint")
+        
+        checkpoint_usage = self.tracker.get_checkpoint_usage("test_checkpoint")
+        
+        # Check tag breakdown in checkpoint
+        self.assertIn("production", checkpoint_usage.tag_breakdown)
+        self.assertIn("development", checkpoint_usage.tag_breakdown)
+        
+        prod_stats = checkpoint_usage.tag_breakdown["production"]
+        self.assertEqual(prod_stats["requests"], 2)
+        self.assertEqual(prod_stats["tokens"], 270)
+        
+        dev_stats = checkpoint_usage.tag_breakdown["development"]
+        self.assertEqual(dev_stats["requests"], 1)
+        self.assertEqual(dev_stats["tokens"], 135)
+    
+    def test_tag_in_usage_summary(self):
+        """Test tag breakdown in usage summary."""
+        # Add test data with tags
+        self.tracker.track_usage("gpt-4", "openai", 100, 50, 150, 0.03, tag="production")
+        self.tracker.track_usage("gpt-3.5-turbo", "openai", 80, 40, 120, 0.02, tag="production")
+        self.tracker.track_usage("claude-3", "anthropic", 90, 45, 135, 0.025, tag="development")
+        
+        summary = get_usage_summary(self.client)
+        
+        # Check that top_tags is in summary
+        self.assertIn("top_tags", summary)
+        
+        # Check top_tags structure
+        top_tags = summary["top_tags"]
+        self.assertIsInstance(top_tags, list)
+        self.assertGreater(len(top_tags), 0)
+        
+        # Verify tag data in top_tags
+        tag_dict = dict(top_tags)
+        self.assertIn("production", tag_dict)
+        self.assertIn("development", tag_dict)
+        
+        # Check production tag stats
+        prod_stats = tag_dict["production"]
+        self.assertEqual(prod_stats["requests"], 2)
+        self.assertEqual(prod_stats["tokens"], 270)
+    
+    def test_tag_in_checkpoint_summary(self):
+        """Test tag breakdown in checkpoint summary."""
+        self.client.start_usage_checkpoint("test_checkpoint")
+        self.tracker.track_usage("gpt-4", "openai", 100, 50, 150, 0.03, tag="production")
+        self.tracker.track_usage("gpt-3.5-turbo", "openai", 80, 40, 120, 0.02, tag="production")
+        self.client.end_usage_checkpoint("test_checkpoint")
+        
+        summary = self.client.get_checkpoint_usage("test_checkpoint")
+        
+        # Check that top_tags is in summary
+        self.assertIn("top_tags", summary)
+        
+        # Check top_tags structure
+        top_tags = summary["top_tags"]
+        self.assertIsInstance(top_tags, list)
+        self.assertGreater(len(top_tags), 0)
+        
+        # Verify tag data
+        tag_dict = dict(top_tags)
+        self.assertIn("production", tag_dict)
+        prod_stats = tag_dict["production"]
+        self.assertEqual(prod_stats["requests"], 2)
+    
+    def test_tag_with_failed_requests(self):
+        """Test that tags are tracked for failed requests."""
+        self.tracker.track_usage(
+            model="gpt-4",
+            provider="openai",
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            cost=0.0,
+            success=False,
+            error_message="Rate limit exceeded",
+            tag="production"
+        )
+        
+        aggregate = self.tracker.get_aggregated_usage()
+        
+        # Check that failed request with tag is included in breakdown
+        self.assertIn("production", aggregate.tag_breakdown)
+        prod_stats = aggregate.tag_breakdown["production"]
+        self.assertEqual(prod_stats["requests"], 1)
+        self.assertEqual(prod_stats["tokens"], 0)  # Failed request has 0 tokens
+        self.assertAlmostEqual(prod_stats["cost"], 0.0, places=6)
+    
+    def test_multiple_tags_aggregation(self):
+        """Test aggregation with multiple different tags."""
+        # Add usage with various tags
+        tags = ["tag1", "tag2", "tag3", "tag1", "tag2", ""]
+        for i, tag in enumerate(tags):
+            self.tracker.track_usage(
+                f"model-{i}", 
+                "openai", 
+                10 + i, 
+                5 + i, 
+                15 + 2*i, 
+                0.001 + i * 0.0001,
+                tag=tag
+            )
+        
+        aggregate = self.tracker.get_aggregated_usage()
+        
+        # Check all tags are in breakdown
+        self.assertIn("tag1", aggregate.tag_breakdown)
+        self.assertIn("tag2", aggregate.tag_breakdown)
+        self.assertIn("tag3", aggregate.tag_breakdown)
+        self.assertIn("", aggregate.tag_breakdown)
+        
+        # Check tag1 has 2 requests
+        tag1_stats = aggregate.tag_breakdown["tag1"]
+        self.assertEqual(tag1_stats["requests"], 2)
+        
+        # Check tag2 has 2 requests
+        tag2_stats = aggregate.tag_breakdown["tag2"]
+        self.assertEqual(tag2_stats["requests"], 2)
+        
+        # Check tag3 has 1 request
+        tag3_stats = aggregate.tag_breakdown["tag3"]
+        self.assertEqual(tag3_stats["requests"], 1)
+    
+    def test_tag_preserved_in_usage_data(self):
+        """Test that tag is preserved when creating UsageData directly."""
+        usage = UsageData(
+            timestamp="2024-01-01T00:00:00Z",
+            model="gpt-4",
+            provider="openai",
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+            cost=0.03,
+            tag="custom-tag"
+        )
+        
+        # Convert to dict and back to verify serialization
+        usage_dict = asdict(usage)
+        self.assertEqual(usage_dict["tag"], "custom-tag")
+        
+        # Verify it can be recreated
+        usage_recreated = UsageData(**usage_dict)
+        self.assertEqual(usage_recreated.tag, "custom-tag")
 
 
 if __name__ == '__main__':

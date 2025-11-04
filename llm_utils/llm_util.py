@@ -113,6 +113,7 @@ class UsageData:
     error_message: Optional[str] = None
     prompt_cost: Optional[float] = None
     completion_cost: Optional[float] = None
+    tag: str = ""
 
 
 @dataclass
@@ -127,6 +128,7 @@ class UsageAggregate:
     success_rate: float
     model_breakdown: Dict[str, Dict[str, Any]]
     provider_breakdown: Dict[str, Dict[str, Any]]
+    tag_breakdown: Dict[str, Dict[str, Any]]
     time_range: Dict[str, str]
 
 
@@ -198,7 +200,8 @@ class LLMUsageTracker:
                    success: bool = True,
                    error_message: Optional[str] = None,
                    prompt_cost: Optional[float] = None,
-                   completion_cost: Optional[float] = None) -> None:
+                   completion_cost: Optional[float] = None,
+                   tag: str = "") -> None:
         """
         Track a single LLM usage event.
         
@@ -215,6 +218,7 @@ class LLMUsageTracker:
             error_message: Error message if request failed
             prompt_cost: Cost for prompt tokens only
             completion_cost: Cost for completion tokens only
+            tag: Optional tag string for categorizing the call
         """
         usage = UsageData(
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -230,6 +234,7 @@ class LLMUsageTracker:
             error_message=error_message,
             prompt_cost=prompt_cost,
             completion_cost=completion_cost,
+            tag=tag,
         )
         
         with self.lock:
@@ -293,6 +298,7 @@ class LLMUsageTracker:
                 success_rate=0.0,
                 model_breakdown={},
                 provider_breakdown={},
+                tag_breakdown={},
                 time_range={"start": "", "end": ""}
             )
         
@@ -343,6 +349,23 @@ class LLMUsageTracker:
             if provider_data['requests'] > 0:
                 provider_data['avg_response_time'] /= provider_data['requests']
         
+        # Tag breakdown
+        tag_breakdown = defaultdict(lambda: {
+            'requests': 0, 'tokens': 0, 'cost': 0.0, 'avg_response_time': 0.0
+        })
+        for data in filtered_data:
+            tag = getattr(data, 'tag', "") or ""
+            tag_breakdown[tag]['requests'] += 1
+            tag_breakdown[tag]['tokens'] += data.total_tokens
+            tag_breakdown[tag]['cost'] += data.cost
+            if data.response_time is not None:
+                tag_breakdown[tag]['avg_response_time'] += data.response_time
+        
+        # Calculate averages for tag breakdown
+        for tag_data in tag_breakdown.values():
+            if tag_data['requests'] > 0:
+                tag_data['avg_response_time'] /= tag_data['requests']
+        
         # Time range
         timestamps = [datetime.fromisoformat(d.timestamp.replace('Z', '+00:00')) for d in filtered_data]
         time_range = {
@@ -360,6 +383,7 @@ class LLMUsageTracker:
             success_rate=success_rate,
             model_breakdown=dict(model_breakdown),
             provider_breakdown=dict(provider_breakdown),
+            tag_breakdown=dict(tag_breakdown),
             time_range=time_range
         )
 
@@ -413,6 +437,7 @@ class LLMUsageTracker:
                     success_rate=0.0,
                     model_breakdown={},
                     provider_breakdown={},
+                    tag_breakdown={},
                     time_range={"start": "", "end": ""}
                 )
 
@@ -441,6 +466,7 @@ class LLMUsageTracker:
                 success_rate=0.0,
                 model_breakdown={},
                 provider_breakdown={},
+                tag_breakdown={},
                 time_range={"start": "", "end": ""}
             )
 
@@ -482,6 +508,20 @@ class LLMUsageTracker:
             if provider_data['requests'] > 0:
                 provider_data['avg_response_time'] /= provider_data['requests']
 
+        tag_breakdown = defaultdict(lambda: {
+            'requests': 0, 'tokens': 0, 'cost': 0.0, 'avg_response_time': 0.0
+        })
+        for data in filtered_data:
+            tag = getattr(data, 'tag', "") or ""
+            tag_breakdown[tag]['requests'] += 1
+            tag_breakdown[tag]['tokens'] += data.total_tokens
+            tag_breakdown[tag]['cost'] += data.cost
+            if data.response_time is not None:
+                tag_breakdown[tag]['avg_response_time'] += data.response_time
+        for tag_data in tag_breakdown.values():
+            if tag_data['requests'] > 0:
+                tag_data['avg_response_time'] /= tag_data['requests']
+
         timestamps = [datetime.fromisoformat(d.timestamp.replace('Z', '+00:00')) for d in filtered_data]
         time_range = {
             "start": min(timestamps).isoformat() if timestamps else "",
@@ -498,6 +538,7 @@ class LLMUsageTracker:
             success_rate=success_rate,
             model_breakdown=dict(model_breakdown),
             provider_breakdown=dict(provider_breakdown),
+            tag_breakdown=dict(tag_breakdown),
             time_range=time_range
         )
     
@@ -763,10 +804,12 @@ class LLMClient:
         """
         start_time = time.time()
         request_id = merged_kwargs.get('request_id')
+        tag = merged_kwargs.pop('tag', "") or ""
         
         # Log request details
         self.logger.info(f"Making LLM {request_type} to {model} ({provider})" + 
-                        (f" with request_id: {request_id}" if request_id else ""))
+                        (f" with request_id: {request_id}" if request_id else "") +
+                        (f" with tag: {tag}" if tag else ""))
         
         # Log request details in debug mode
         self.logger.debug(f"Request parameters: {merged_kwargs}")
@@ -806,6 +849,7 @@ class LLMClient:
                     success=True,
                     prompt_cost=prompt_cost,
                     completion_cost=completion_cost,
+                    tag=tag,
                 )
                 
                 # Log successful response
@@ -842,7 +886,8 @@ class LLMClient:
                         request_id=request_id,
                         response_time=response_time,
                         success=False,
-                        error_message=str(e)
+                        error_message=str(e),
+                        tag=tag,
                     )
                     self.logger.error(f"LLM {request_type} failed after {self.default_retry_attempts} attempts: {type(e).__name__}: {e}")
                     raise e
@@ -859,7 +904,8 @@ class LLMClient:
                     request_id=request_id,
                     response_time=response_time,
                     success=False,
-                    error_message=str(e)
+                    error_message=str(e),
+                    tag=tag,
                 )
                 self.logger.error(f"Unexpected error in LLM {request_type}: {type(e).__name__}: {e}")
                 raise e
@@ -908,6 +954,7 @@ class LLMClient:
     def _make_request(self, 
                      messages: List[Dict[str, str]],
                      model: Optional[str] = None,
+                     tag: str = "",
                      **kwargs) -> Dict[str, Any]:
         """
         Make an LLM request with retry logic and usage tracking.
@@ -915,11 +962,14 @@ class LLMClient:
         Args:
             messages: List of message dictionaries
             model: The model to use (e.g., 'gpt-4', 'claude-3-sonnet'). If None, uses default_model.
+            tag: Optional tag string for categorizing this call in usage tracking
             **kwargs: Additional arguments for the completion call
             
         Returns:
             Response dictionary from LiteLLM
         """
+        # Pass tag through kwargs so it gets into merged_kwargs
+        kwargs['tag'] = tag
         model, provider, merged_kwargs = self._prepare_request(model, **kwargs)
         
         # Log messages in debug mode
@@ -953,6 +1003,7 @@ class LLMClient:
     def chat_completion(self,
                        messages: List[Dict[str, str]],
                        model: Optional[str] = None,
+                       tag: str = "",
                        **kwargs) -> Dict[str, Any]:
         """
         Make a chat completion request.
@@ -960,16 +1011,18 @@ class LLMClient:
         Args:
             messages: List of message dictionaries with 'role' and 'content' keys
             model: The model to use. If None, uses default_model.
+            tag: Optional tag string for categorizing this call in usage tracking
             **kwargs: Additional arguments for the completion call
             
         Returns:
             Response dictionary from LiteLLM
         """
-        return self._make_request(messages, model, **kwargs)
+        return self._make_request(messages, model, tag=tag, **kwargs)
     
     def text_completion(self,
                        prompt: str,
                        model: Optional[str] = None,
+                       tag: str = "",
                        **kwargs) -> Dict[str, Any]:
         """
         Make a text completion request.
@@ -977,11 +1030,14 @@ class LLMClient:
         Args:
             prompt: The text prompt
             model: The model to use. If None, uses default_model.
+            tag: Optional tag string for categorizing this call in usage tracking
             **kwargs: Additional arguments for the text_completion call
             
         Returns:
             Response dictionary from LiteLLM
         """
+        # Pass tag through kwargs so it gets into merged_kwargs
+        kwargs['tag'] = tag
         model, provider, merged_kwargs = self._prepare_request(model, **kwargs)
         
         # Log prompt in debug mode
@@ -1015,6 +1071,7 @@ class LLMClient:
     def embedding(self,
                   input: Union[str, List[str]],
                   model: Optional[str] = None,
+                  tag: str = "",
                   **kwargs) -> Dict[str, Any]:
         """
         Make an embedding request.
@@ -1022,11 +1079,14 @@ class LLMClient:
         Args:
             input: The text or list of texts to embed
             model: The model to use. If None, uses default_model.
+            tag: Optional tag string for categorizing this call in usage tracking
             **kwargs: Additional arguments for the embedding call
             
         Returns:
             Response dictionary from LiteLLM with embeddings
         """
+        # Pass tag through kwargs so it gets into merged_kwargs
+        kwargs['tag'] = tag
         model, provider, merged_kwargs = self._prepare_request(model, **kwargs)
         
         # Normalize input to list for consistent handling
@@ -1250,6 +1310,7 @@ class LLMClient:
             "success_rate": f"{stats.success_rate:.1%}",
             "top_models": sorted(stats.model_breakdown.items(), key=lambda x: x[1]['requests'], reverse=True)[:5],
             "top_providers": sorted(stats.provider_breakdown.items(), key=lambda x: x[1]['requests'], reverse=True)[:5],
+            "top_tags": sorted(stats.tag_breakdown.items(), key=lambda x: x[1]['requests'], reverse=True)[:5],
         }
 
 
@@ -1310,6 +1371,8 @@ def get_usage_summary(client: LLMClient, **kwargs) -> Dict[str, Any]:
         "top_models": sorted(stats.model_breakdown.items(), 
                            key=lambda x: x[1]['requests'], reverse=True)[:5],
         "top_providers": sorted(stats.provider_breakdown.items(), 
-                              key=lambda x: x[1]['requests'], reverse=True)[:5]
+                              key=lambda x: x[1]['requests'], reverse=True)[:5],
+        "top_tags": sorted(stats.tag_breakdown.items(), 
+                         key=lambda x: x[1]['requests'], reverse=True)[:5]
     }
 
