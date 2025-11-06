@@ -782,17 +782,27 @@ class LLMClient:
                 
                 # Track successful usage
                 response_time = time.time() - start_time
-                total_cost = litellm_get_total_cost(response)
+                try:
+                    total_cost = litellm_get_total_cost(response)
+                    
+                    # Get detailed cost breakdown - this will be customized by the calling method
+                    prompt_tokens, completion_tokens, total_tokens = self._calculate_tokens_for_response(
+                        model, response, merged_kwargs
+                    )
+                    
+                    # Calculate detailed costs
+                    prompt_cost, completion_cost, _= self.usage_tracker.calculate_token_costs(
+                        model, prompt_tokens, completion_tokens
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Failed to calculate token costs for {model}: {e}")
+                    total_cost = 0.0
+                    prompt_cost = 0.0
+                    completion_cost = 0.0
+                    prompt_tokens = 0
+                    completion_tokens = 0
+                    total_tokens = 0
                 
-                # Get detailed cost breakdown - this will be customized by the calling method
-                prompt_tokens, completion_tokens, total_tokens = self._calculate_tokens_for_response(
-                    model, response, merged_kwargs
-                )
-                
-                # Calculate detailed costs
-                prompt_cost, completion_cost, _= self.usage_tracker.calculate_token_costs(
-                    model, prompt_tokens, completion_tokens
-                )
                 
                 self.usage_tracker.track_usage(
                     model=model,
